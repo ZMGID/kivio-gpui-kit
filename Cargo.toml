@@ -41,6 +41,8 @@ members = [
     "examples/speech",
     "crates/shell",
 ]
+# Patched copies of the crates.io `gpui-pre*` 0.3.10 packages; consumers reach them through `[patch.crates-io]`.
+exclude = ["gpui-pre"]
 resolver = "2"
 
 [workspace.package]

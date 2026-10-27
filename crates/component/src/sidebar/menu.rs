@@ -272,6 +272,11 @@ impl SidebarItem for SidebarMenuItem {
         let default_open = self.default_open;
         let collapsed_tooltip = self.collapsed_tooltip();
         let id = id.into();
+        let focus_handle = window
+            .use_keyed_state((id.clone(), "focus"), cx, |_, cx| cx.focus_handle())
+            .read(cx)
+            .clone();
+        let is_focused = focus_handle.is_focused(window);
         let label_text = self.label.clone();
         let accessibility_label = self.accessibility_label.clone();
         let is_submenu = self.is_submenu();
@@ -297,10 +302,15 @@ impl SidebarItem for SidebarMenuItem {
                 h_flex()
                     .size_full()
                     .id("item")
+                    .test_support()
+                    .when(!self.disabled || is_focused, |this| {
+                        this.track_focus(&focus_handle.tab_stop(!self.disabled))
+                    })
                     .role(Role::TreeItem)
                     .aria_label(accessibility_label.unwrap_or_else(|| label_text.clone()))
                     .aria_selected(is_active)
                     .overflow_x_hidden()
+                    .relative()
                     .flex_shrink_0()
                     .p_2()
                     .gap_x_2()
@@ -372,6 +382,19 @@ impl SidebarItem for SidebarMenuItem {
                     })
                     .when(is_disabled, |this| {
                         this.text_color(cx.theme().muted_foreground)
+                    })
+                    .when(is_focused && !is_disabled, |this| {
+                        let mut outline = StyleRefinement::default();
+                        outline.corner_radii = self.style.corner_radii.clone();
+                        this.child(
+                            div()
+                                .absolute()
+                                .inset_0()
+                                .border_1()
+                                .border_color(cx.theme().ring)
+                                .rounded(cx.theme().radius)
+                                .refine_style(&outline),
+                        )
                     })
                     .when(!is_disabled, |this| {
                         this.on_click({
@@ -469,5 +492,270 @@ mod tests {
             SidebarMenuItem::new("Projects").children(vec![SidebarMenuItem::new("Overview")]);
 
         assert_eq!(item.caret_accessibility_label(), "Toggle Projects submenu");
+    }
+
+    #[cfg(feature = "test-support")]
+    mod keyboard {
+        use super::*;
+        use crate::sidebar::Sidebar;
+        use gpui::{
+            AppContext as _, Context, Entity, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers,
+            Render, TestAppContext, VisualTestContext,
+        };
+        use gpui_base::test_support::{ElementSnapshot, snapshots};
+
+        struct Navigation {
+            home_disabled: bool,
+            click_to_open: bool,
+            collapsed: bool,
+            clicks: Vec<(&'static str, bool)>,
+        }
+
+        impl Render for Navigation {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                v_flex().size_full().tab_group().child(
+                    Sidebar::new("navigation")
+                        .collapsible(true)
+                        .collapsed(self.collapsed)
+                        .header(Button::new("before").label("Before"))
+                        .child(
+                            SidebarMenu::new().children([
+                                SidebarMenuItem::new("Home")
+                                    .icon(Icon::default())
+                                    .disable(self.home_disabled)
+                                    .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
+                                        this.clicks.push(("home", event.is_keyboard()));
+                                        cx.notify();
+                                    })),
+                                SidebarMenuItem::new("Disabled")
+                                    .icon(IconName::Inbox)
+                                    .disable(true)
+                                    .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
+                                        this.clicks.push(("disabled", event.is_keyboard()));
+                                        cx.notify();
+                                    })),
+                                SidebarMenuItem::new("Projects")
+                                    .icon(IconName::Folder)
+                                    .click_to_open(self.click_to_open)
+                                    .click_to_toggle(true)
+                                    .children([SidebarMenuItem::new("Child").on_click(
+                                        cx.listener(|this, event: &ClickEvent, _, cx| {
+                                            this.clicks.push(("child", event.is_keyboard()));
+                                            cx.notify();
+                                        }),
+                                    )])
+                                    .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
+                                        this.clicks.push(("projects", event.is_keyboard()));
+                                        cx.notify();
+                                    })),
+                            ]),
+                        )
+                        .footer(Button::new("after").label("After")),
+                )
+            }
+        }
+
+        fn setup(
+            cx: &mut TestAppContext,
+            collapsed: bool,
+        ) -> (Entity<Navigation>, &mut VisualTestContext) {
+            cx.update(crate::init);
+            let view = cx.new(|_| Navigation {
+                home_disabled: false,
+                click_to_open: false,
+                collapsed,
+                clicks: Vec::new(),
+            });
+            let (_, cx) = cx.add_window_view({
+                let view = view.clone();
+                move |window, cx| crate::Root::new(view, window, cx)
+            });
+            cx.update(|window, cx| {
+                window.activate_window();
+                window.draw(cx).clear(cx);
+                window.focus_next(cx);
+                window.draw(cx).clear(cx);
+            });
+            (view, cx)
+        }
+
+        fn observed(cx: &mut VisualTestContext, label: &str) -> Option<ElementSnapshot> {
+            cx.update(|window, _| {
+                snapshots(window)
+                    .into_iter()
+                    .find(|element| element.label() == Some(label))
+            })
+        }
+
+        fn assert_focused(cx: &mut VisualTestContext, label: &str) {
+            assert_eq!(
+                observed(cx, label).expect("control is rendered").focused(),
+                Some(true),
+                "{label} should have focus"
+            );
+        }
+
+        fn press(cx: &mut VisualTestContext, key: &str) {
+            let keystroke =
+                cx.update(|_, cx| Keystroke::parse_with_os(key, cx.platform_info().os).unwrap());
+            cx.simulate_event(KeyDownEvent {
+                keystroke: keystroke.clone(),
+                is_held: false,
+                prefer_character_input: false,
+            });
+            cx.simulate_event(KeyUpEvent { keystroke });
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        }
+
+        #[gpui::test]
+        fn rows_traverse_activate_and_skip_disabled(cx: &mut TestAppContext) {
+            let (view, cx) = setup(cx, false);
+            assert_focused(cx, "Before");
+            press(cx, "tab");
+            assert_focused(cx, "Home");
+            let focused = cx.update(|window, cx| window.focused(cx));
+
+            press(cx, "enter");
+            press(cx, "space");
+            assert_focused(cx, "Home");
+            cx.update(|window, cx| {
+                assert_eq!(window.focused(cx), focused);
+                assert_eq!(view.read(cx).clicks, [("home", true), ("home", true)]);
+            });
+
+            press(cx, "tab");
+            assert_focused(cx, "Projects");
+            press(cx, "shift-tab");
+            assert_focused(cx, "Home");
+            let disabled = observed(cx, "Disabled").unwrap().bounds().center();
+            cx.simulate_click(disabled, Modifiers::default());
+            let home = observed(cx, "Home").unwrap().bounds().center();
+            cx.simulate_click(home, Modifiers::default());
+            cx.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                assert_eq!(
+                    view.read(cx).clicks,
+                    [("home", true), ("home", true), ("home", false)]
+                );
+            });
+
+            view.update(cx, |this, cx| {
+                this.home_disabled = true;
+                cx.notify();
+            });
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            assert_focused(cx, "Home");
+            press(cx, "enter");
+            press(cx, "space");
+            cx.update(|_, cx| assert_eq!(view.read(cx).clicks.len(), 3));
+            press(cx, "tab");
+            assert_focused(cx, "Projects");
+            press(cx, "shift-tab");
+            assert_focused(cx, "Before");
+
+            view.update(cx, |this, cx| {
+                this.home_disabled = false;
+                cx.notify();
+            });
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            press(cx, "tab");
+            assert_focused(cx, "Home");
+        }
+
+        #[gpui::test]
+        fn submenu_row_and_caret_activate_independently(cx: &mut TestAppContext) {
+            let (view, cx) = setup(cx, false);
+            press(cx, "tab");
+            press(cx, "tab");
+            assert_focused(cx, "Projects");
+            assert!(observed(cx, "Child").is_none());
+
+            press(cx, "enter");
+            assert!(observed(cx, "Child").is_some());
+            assert_focused(cx, "Projects");
+            press(cx, "space");
+            assert!(observed(cx, "Child").is_none());
+            cx.update(|_, cx| {
+                assert_eq!(
+                    view.read(cx).clicks,
+                    [("projects", true), ("projects", true)]
+                );
+            });
+
+            press(cx, "tab");
+            assert_focused(cx, "Toggle Projects submenu");
+            press(cx, "enter");
+            assert!(observed(cx, "Child").is_some());
+            cx.update(|_, cx| assert_eq!(view.read(cx).clicks.len(), 2));
+            press(cx, "tab");
+            assert_focused(cx, "Child");
+            press(cx, "enter");
+            cx.update(|_, cx| assert_eq!(view.read(cx).clicks[2], ("child", true)));
+            press(cx, "shift-tab");
+            assert_focused(cx, "Toggle Projects submenu");
+            press(cx, "space");
+            assert!(observed(cx, "Child").is_none());
+            cx.update(|_, cx| assert_eq!(view.read(cx).clicks.len(), 3));
+
+            let caret = observed(cx, "Toggle Projects submenu")
+                .unwrap()
+                .bounds()
+                .center();
+            cx.simulate_click(caret, Modifiers::default());
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            assert!(observed(cx, "Child").is_some());
+            cx.update(|_, cx| assert_eq!(view.read(cx).clicks.len(), 3));
+
+            let row = observed(cx, "Projects").unwrap().bounds().center();
+            cx.simulate_click(row, Modifiers::default());
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            assert!(observed(cx, "Child").is_none());
+            cx.update(|_, cx| assert_eq!(view.read(cx).clicks[3], ("projects", false)));
+        }
+
+        #[gpui::test]
+        fn click_to_open_stays_open_for_both_activation_keys(cx: &mut TestAppContext) {
+            let (view, cx) = setup(cx, false);
+            view.update(cx, |this, cx| {
+                this.click_to_open = true;
+                cx.notify();
+            });
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            press(cx, "tab");
+            press(cx, "tab");
+            assert_focused(cx, "Projects");
+            press(cx, "enter");
+            assert!(observed(cx, "Child").is_some());
+            press(cx, "space");
+            assert!(observed(cx, "Child").is_some());
+            cx.update(|_, cx| {
+                assert_eq!(
+                    view.read(cx).clicks,
+                    [("projects", true), ("projects", true)]
+                );
+            });
+        }
+
+        #[gpui::test]
+        fn collapsed_row_activates_without_showing_submenu(cx: &mut TestAppContext) {
+            let (view, cx) = setup(cx, true);
+            press(cx, "tab");
+            press(cx, "tab");
+            assert_focused(cx, "Projects");
+            assert!(observed(cx, "Toggle Projects submenu").is_none());
+            let focused = cx.update(|window, cx| window.focused(cx));
+            press(cx, "enter");
+            assert!(observed(cx, "Child").is_none());
+            assert_focused(cx, "Projects");
+            cx.update(|window, cx| assert_eq!(window.focused(cx), focused));
+            press(cx, "space");
+            assert!(observed(cx, "Child").is_none());
+            cx.update(|_, cx| {
+                assert_eq!(
+                    view.read(cx).clicks,
+                    [("projects", true), ("projects", true)]
+                );
+            });
+        }
     }
 }

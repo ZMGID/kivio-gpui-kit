@@ -20,7 +20,9 @@ Each patch is one commit with its own regression test. Implementations follow Ze
 
 | Patch | Packages | Reference | Commit |
 | --- | --- | --- | --- |
-| _(none yet)_ | | | |
+| Sidebar keyboard navigation | `gpui-component` | Kit Base `Button` focus handling and GPUI native keyboard clicks | `Fix sidebar keyboard navigation` |
+
+The sidebar patch starts from fork commit `e485b337f2ecb778cf3a5265488baf4dfaac663d`. It uses the existing `gpui-pre` 0.3.10 focus and click behavior, not code copied from Zeron. In the Kivio P1 Windows repro, Tab from the last gallery button skipped all sidebar destinations and wrapped to the first gallery button. The component regression tests exercise Tab, Enter and Space, disabled rows, retained focus, mouse clicks and submenu/caret behavior with `--features test-support`.
 
 Vendored packages: `gpui-pre`, `gpui-pre-platform`, `gpui-pre-windows`, `gpui-pre-macos`, `gpui-pre-apple`, `gpui-pre-wgpu`.
 

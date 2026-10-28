@@ -49,7 +49,7 @@ type StackSafe<T> = stacksafe::StackSafe<T>;
 #[cfg(not(feature = "stacker"))]
 type StackSafe<T> = T;
 
-const DRAG_THRESHOLD: f64 = 2.;
+const DRAG_THRESHOLD: f64 = 4.;
 const DEFAULT_TOOLTIP_SHOW_DELAY: Duration = Duration::from_millis(500);
 const HOVERABLE_TOOLTIP_HIDE_DELAY: Duration = Duration::from_millis(500);
 
@@ -3036,11 +3036,21 @@ impl Interactivity {
                         }
 
                         let mut pending_mouse_down = pending_mouse_down.borrow_mut();
+                        // A missed release must not turn the next hover into a drag.
+                        if pending_mouse_down
+                            .as_ref()
+                            .is_some_and(|down| event.pressed_button != Some(down.button))
+                        {
+                            pending_mouse_down.take();
+                            *clicked_state.borrow_mut() = ElementClickedState::default();
+                            window.refresh();
+                            return;
+                        }
                         if let Some(mouse_down) = pending_mouse_down.clone()
                             && !cx.has_active_drag()
                             && (event.position - mouse_down.position).magnitude() > DRAG_THRESHOLD
-                            && let Some(listener) = drag_listener.take()
                             && mouse_down.button == MouseButton::Left
+                            && let Some(listener) = drag_listener.take()
                         {
                             *clicked_state.borrow_mut() = ElementClickedState::default();
                             let cursor_offset = event.position - hitbox.origin;
@@ -4505,6 +4515,195 @@ mod tests {
         MouseMoveEvent, TestAppContext, TouchEvent, TouchId, canvas, util::FluentBuilder as _,
     };
     use std::{cell::Cell, rc::Weak};
+
+    #[gpui::test]
+    fn drag_requires_deliberate_held_left_motion(cx: &mut TestAppContext) {
+        #[derive(Default)]
+        struct Observed {
+            clicks: RefCell<Vec<(Point<Pixels>, Point<Pixels>)>>,
+            aux_clicks: Cell<usize>,
+            drag_offsets: RefCell<Vec<Point<Pixels>>>,
+        }
+
+        struct DragView(Rc<Observed>);
+
+        impl Render for DragView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().relative().size_full().child(
+                    div()
+                        .id("drag-target")
+                        .absolute()
+                        .left(px(10.))
+                        .top(px(20.))
+                        .size(px(120.))
+                        .on_click({
+                            let observed = self.0.clone();
+                            move |event, _, _| {
+                                if let ClickEvent::Mouse(event) = event {
+                                    observed
+                                        .clicks
+                                        .borrow_mut()
+                                        .push((event.down.position, event.up.position));
+                                }
+                            }
+                        })
+                        .on_aux_click({
+                            let observed = self.0.clone();
+                            move |_, _, _| observed.aux_clicks.set(observed.aux_clicks.get() + 1)
+                        })
+                        .on_drag((), {
+                            let observed = self.0.clone();
+                            move |_, offset, _, cx| {
+                                observed.drag_offsets.borrow_mut().push(offset);
+                                cx.new(|_| crate::Empty)
+                            }
+                        }),
+                )
+            }
+        }
+
+        let observed = Rc::new(Observed::default());
+        let (_, cx) = cx.add_window_view({
+            let observed = observed.clone();
+            move |_, _| DragView(observed)
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        let start = point(px(30.), px(40.));
+        let modifiers = crate::Modifiers::default();
+        cx.simulate_mouse_down(start, MouseButton::Left, modifiers);
+        for delta in [
+            point(px(3.9), px(0.)),
+            point(px(3.), px(2.)),
+            point(px(4.), px(0.)),
+        ] {
+            cx.simulate_mouse_move(start + delta, Some(MouseButton::Left), modifiers);
+            assert!(observed.drag_offsets.borrow().is_empty());
+        }
+        let click_end = start + point(px(4.), px(0.));
+        cx.simulate_mouse_up(click_end, MouseButton::Left, modifiers);
+        assert_eq!(*observed.clicks.borrow(), [(start, click_end)]);
+
+        // Right-button motion must not consume this frame's left-drag listener.
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.dispatch_event(
+                MouseDownEvent {
+                    button: MouseButton::Right,
+                    position: start,
+                    click_count: 1,
+                    ..Default::default()
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.dispatch_event(
+                MouseMoveEvent {
+                    position: start + point(px(5.), px(0.)),
+                    pressed_button: Some(MouseButton::Right),
+                    ..Default::default()
+                }
+                .to_platform_input(),
+                cx,
+            );
+            assert!(observed.drag_offsets.borrow().is_empty());
+            window.dispatch_event(
+                MouseUpEvent {
+                    button: MouseButton::Right,
+                    position: start + point(px(5.), px(0.)),
+                    click_count: 1,
+                    ..Default::default()
+                }
+                .to_platform_input(),
+                cx,
+            );
+            assert_eq!(observed.aux_clicks.get(), 1);
+            window.dispatch_event(
+                MouseDownEvent {
+                    button: MouseButton::Left,
+                    position: start,
+                    click_count: 1,
+                    ..Default::default()
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.dispatch_event(
+                MouseMoveEvent {
+                    position: start + point(px(3.), px(2.)),
+                    pressed_button: Some(MouseButton::Left),
+                    ..Default::default()
+                }
+                .to_platform_input(),
+                cx,
+            );
+            assert!(observed.drag_offsets.borrow().is_empty());
+            let diagonal = start + point(px(3.), px(3.));
+            window.dispatch_event(
+                MouseMoveEvent {
+                    position: diagonal,
+                    pressed_button: Some(MouseButton::Left),
+                    ..Default::default()
+                }
+                .to_platform_input(),
+                cx,
+            );
+            assert!(cx.has_active_drag());
+            assert_eq!(
+                *observed.drag_offsets.borrow(),
+                [diagonal - point(px(10.), px(20.))]
+            );
+            window.dispatch_event(
+                MouseMoveEvent {
+                    position: start + point(px(10.), px(10.)),
+                    pressed_button: Some(MouseButton::Left),
+                    ..Default::default()
+                }
+                .to_platform_input(),
+                cx,
+            );
+            assert_eq!(observed.drag_offsets.borrow().len(), 1);
+            window.dispatch_event(
+                MouseUpEvent {
+                    button: MouseButton::Left,
+                    position: diagonal,
+                    click_count: 1,
+                    ..Default::default()
+                }
+                .to_platform_input(),
+                cx,
+            );
+            assert!(!cx.has_active_drag());
+        });
+        assert_eq!(observed.clicks.borrow().len(), 1);
+
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.simulate_mouse_move(start + point(px(20.), px(0.)), None, modifiers);
+        assert_eq!(observed.drag_offsets.borrow().len(), 1);
+
+        // The release may be missed; a hover or another button is not a held left press.
+        for pressed_button in [None, Some(MouseButton::Right)] {
+            cx.simulate_mouse_down(start, MouseButton::Left, modifiers);
+            let end = start + point(px(8.), px(0.));
+            cx.simulate_mouse_move(end, pressed_button, modifiers);
+            cx.simulate_mouse_up(end, MouseButton::Left, modifiers);
+            assert_eq!(observed.drag_offsets.borrow().len(), 1);
+            assert_eq!(observed.clicks.borrow().len(), 1);
+        }
+
+        let next_start = point(px(45.), px(50.));
+        cx.simulate_mouse_down(next_start, MouseButton::Left, modifiers);
+        let next_move = next_start + point(px(4.01), px(0.));
+        cx.simulate_mouse_move(next_move, Some(MouseButton::Left), modifiers);
+        assert!(cx.update(|_, cx| cx.has_active_drag()));
+        assert_eq!(
+            *observed.drag_offsets.borrow(),
+            [point(px(23.), px(23.)), next_move - point(px(10.), px(20.))]
+        );
+        cx.simulate_mouse_up(next_move, MouseButton::Left, modifiers);
+        assert!(!cx.update(|_, cx| cx.has_active_drag()));
+        assert_eq!(observed.clicks.borrow().len(), 1);
+    }
 
     struct GroupHoverTestView {
         render_count: Rc<Cell<usize>>,

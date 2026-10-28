@@ -207,7 +207,7 @@ fn border_widths(style: &StyleRefinement, rem_size: Pixels) -> Edges<Pixels> {
     }
 }
 
-fn corner_radii(style: &StyleRefinement, rem_size: Pixels) -> Corners<Pixels> {
+pub(crate) fn corner_radii(style: &StyleRefinement, rem_size: Pixels) -> Corners<Pixels> {
     let radius = |value: Option<gpui::AbsoluteLength>| {
         value.map(|v| v.to_pixels(rem_size)).unwrap_or_default()
     };

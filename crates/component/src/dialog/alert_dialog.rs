@@ -542,6 +542,128 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "gpui-fast"))]
+    #[gpui::test]
+    fn backdrop_blur_tracks_the_alert_surface_and_escape_still_cancels(cx: &mut TestAppContext) {
+        use crate::{ActiveTheme as _, OverlayBackdrop, Theme, ThemeMode};
+        use gpui::{Background, div, rgb};
+
+        let cx = window(cx, size(px(800.), px(600.)));
+        let cancelled = Rc::new(Cell::new(false));
+        cx.update(|window, cx| {
+            cx.set_global(OverlayBackdrop::new(px(12.), 0.9));
+            let cancelled = cancelled.clone();
+            window.open_alert_dialog(cx, move |alert, _, _| {
+                let cancelled = cancelled.clone();
+                alert
+                    .title("Unsaved changes")
+                    .description("Discard the draft?")
+                    .confirm()
+                    .child(div().w(px(30.)).h(px(12.)).bg(rgb(0xfa2184)))
+                    .on_cancel(move |_, _, _| {
+                        cancelled.set(true);
+                        true
+                    })
+            });
+        });
+        cx.run_until_parked();
+
+        for (mode, dimensions) in [
+            (ThemeMode::Light, size(px(800.), px(600.))),
+            (ThemeMode::Dark, size(px(560.), px(400.))),
+        ] {
+            cx.simulate_resize(dimensions);
+            cx.update(|window, cx| {
+                Theme::change(mode, None, cx);
+                window.draw(cx).clear(cx);
+                window.draw(cx).clear(cx);
+
+                let blurs = window.painted_backdrop_blurs();
+                assert_eq!(blurs.len(), 1);
+                let blur = &blurs[0];
+                let quads = window.painted_quads();
+                let tint = Background::from(cx.theme().tokens.background).opacity(0.9);
+                let surface = quads
+                    .iter()
+                    .find(|quad| quad.bounds == blur.bounds && quad.background == tint)
+                    .expect("the blur follows the dialog panel, not its modal root");
+                let foreground = quads
+                    .iter()
+                    .find(|quad| quad.background == Background::from(rgb(0xfa2184)))
+                    .expect("the dialog content was painted");
+                assert_eq!(blur.corner_radii, surface.corner_radii);
+                assert!(blur.order < surface.order);
+                assert!(surface.order < foreground.order);
+                assert!(blur.bounds.size.width < dimensions.width.scale(window.scale_factor()));
+                assert!(blur.bounds.size.height < dimensions.height.scale(window.scale_factor()));
+            });
+        }
+        cx.simulate_keystrokes("escape");
+        assert!(cancelled.get());
+        cx.update(|window, cx| assert!(!window.has_active_dialog(cx)));
+    }
+
+    #[cfg(not(feature = "gpui-fast"))]
+    #[gpui::test]
+    fn stacked_backdrops_keep_paint_order_and_escape_on_the_top_dialog(cx: &mut TestAppContext) {
+        use crate::{ActiveTheme as _, OverlayBackdrop, root::WindowState};
+        use gpui::Background;
+
+        let cx = window(cx, size(px(800.), px(600.)));
+        let cancelled = Rc::new(Cell::new(0));
+        cx.update(|window, cx| {
+            cx.set_global(OverlayBackdrop::new(px(12.), 0.9));
+            for layer in 1..=2 {
+                let cancelled = cancelled.clone();
+                window.open_alert_dialog(cx, move |alert, _, _| {
+                    let cancelled = cancelled.clone();
+                    alert
+                        .title(format!("Dialog {layer}"))
+                        .confirm()
+                        .on_cancel(move |_, _, _| {
+                            cancelled.set(layer);
+                            true
+                        })
+                });
+            }
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.draw(cx).clear(cx);
+            let blurs = window.painted_backdrop_blurs();
+            assert_eq!(blurs.len(), 2);
+            let tint = Background::from(cx.theme().tokens.background).opacity(0.9);
+            let quads = window.painted_quads();
+            let first = quads
+                .iter()
+                .find(|quad| quad.bounds == blurs[0].bounds && quad.background == tint)
+                .unwrap();
+            let second = quads
+                .iter()
+                .find(|quad| quad.bounds == blurs[1].bounds && quad.background == tint)
+                .unwrap();
+            assert!(blurs[0].order < first.order);
+            assert!(first.order < blurs[1].order);
+            assert!(blurs[1].order < second.order);
+            assert!(
+                WindowState::read(window, cx).active_dialogs[1]
+                    .focus_handle()
+                    .is_focused(window)
+            );
+        });
+        cx.simulate_keystrokes("escape");
+        assert_eq!(cancelled.get(), 2);
+        cx.update(|window, cx| {
+            let state = WindowState::read(window, cx);
+            assert_eq!(state.active_dialogs.len(), 1);
+            assert!(state.active_dialogs[0].focus_handle().is_focused(window));
+        });
+        cx.simulate_keystrokes("escape");
+        assert_eq!(cancelled.get(), 1);
+        cx.update(|window, cx| assert!(!window.has_active_dialog(cx)));
+    }
+
     /// `centered` seats the surface in the vertical middle of the window,
     /// whatever its height.
     #[gpui::test]

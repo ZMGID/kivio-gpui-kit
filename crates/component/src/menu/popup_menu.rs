@@ -2,6 +2,7 @@ use crate::ThemeStyled as _;
 use crate::actions::{Cancel, Confirm, SelectDown, SelectUp};
 use crate::actions::{SelectLeft, SelectRight};
 use crate::menu::menu_item::MenuItemElement;
+use crate::overlay_backdrop::{BackdropSurface, OverlayBackdrop};
 use crate::scroll::ScrollableElement;
 use crate::{ActiveTheme, ElementExt, Icon, IconName, Sizable as _, h_flex, v_flex};
 use crate::{Side, Size, kbd::Kbd};
@@ -1492,6 +1493,7 @@ impl Render for PopupMenu {
             check_side: self.check_side,
             radius: cx.theme().radius.min(px(8.)),
         };
+        let backdrop = OverlayBackdrop::active(cx);
 
         v_flex()
             .id("popup-menu")
@@ -1507,6 +1509,9 @@ impl Render for PopupMenu {
             .on_action(cx.listener(Self::dismiss))
             .on_mouse_down_out(cx.listener(Self::on_mouse_down_out))
             .popover_style(cx)
+            .when_some(backdrop, |surface, backdrop| {
+                surface.bg(backdrop.tint(cx.theme().popover))
+            })
             .text_color(cx.theme().popover_foreground)
             .relative()
             .occlude()
@@ -1536,6 +1541,7 @@ impl Render for PopupMenu {
             .when(self.scrollable, |this| {
                 this.vertical_scrollbar(&self.scroll_handle)
             })
+            .map(|surface| BackdropSurface::new(surface, backdrop))
     }
 }
 

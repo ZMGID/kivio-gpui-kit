@@ -27,6 +27,7 @@ Maintain each conceptual patch as a separate commit with regression coverage. Wh
 | Verbatim selection copy | `gpui-base`, Kit regression | Existing `TextSelection::selected_text`; remove trimming in Root and TextView | `94ead70` |
 | Windows tray hide/restore | `gpui-pre-windows` | Native `ShowWindowAsync`, preserving existing activation handling | `fix(windows): hide and restore windows for tray activation` |
 | Frozen benchmark readout | `gpui-fps` | Existing frame sampler and trace guard; terminal publication for a bounded run | `fix(fps): freeze completed benchmark readings` |
+| Opt-in frosted overlay surfaces | `gpui-component`, `gpui-pre` | Existing Kit dialog/menu/notification lifecycles and the backdrop API above | `feat(component): apply opt-in backdrop to overlay surfaces` |
 
 The sidebar patch starts from fork commit `e485b337f2ecb778cf3a5265488baf4dfaac663d`. It uses the existing `gpui-pre` 0.3.10 focus and click behavior, not code copied from Zeron. In the Kivio P1 Windows repro, Tab from the last gallery button skipped all sidebar destinations and wrapped to the first gallery button. The component regression tests exercise Tab, Enter and Space, disabled rows, retained focus, mouse clicks and submenu/caret behavior with `--features test-support`.
 
@@ -42,6 +43,8 @@ The sidebar patch starts from fork commit `e485b337f2ecb778cf3a5265488baf4dfaac6
   The WGPU path-composition regression also adapts zui `crates/gpui_windows/src/directx_renderer/backdrop_tests.rs`.
 
 `FpsMonitor::finish` drains pending samples, publishes once, releases its clock and trace guard, and freezes later renders. Start another run with a new monitor. All 35 FPS tests passed, including late frames, repeated finish, retained resource readings and trace ownership. Kivio's native Windows release run streamed 3,000 Unicode scalars while scrolling 2,000 messages for 60.007 seconds; the frozen HUD reported P95 3.6 ms and 0.0% dropped frames.
+
+`OverlayBackdrop` is an optional application global: dialog, menu and notification surfaces blur their actual rounded bounds immediately before painting the theme tint and sharp contents. Without the global (or with `gpui-fast`) the existing surface is unchanged. Inherited opacity is respected; because the blur primitive has no alpha, fades taper sigma rather than blending a separate blurred image. Application policy stays outside Kit. All 734 component unit tests and 50 integration tests passed, including theme tint, scene order, zero/inherited opacity, stacked-dialog Escape and focus behavior.
 
 The fork root `[patch.crates-io]` points its six vendored packages to local paths so workspace examples and tests exercise these changes rather than the published snapshots. Kivio's own workspace still supplies its pinned git patches. The example can be launched from the fork root with `cargo run -p gpui-kit --example backdrop_blur`; click its heading to compare blur and fade on and off. It shows nested blurred panels, sharp foreground and a four-edge fade.
 

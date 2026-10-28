@@ -23,6 +23,7 @@ use crate::{
     ActiveTheme as _, Edges, Icon, IconName, Sizable as _, StyledExt, TITLE_BAR_HEIGHT,
     animation::cubic_bezier,
     button::{Button, ButtonVariants as _},
+    overlay_backdrop::{BackdropSurface, OverlayBackdrop},
     styled::toast_shadow,
     v_flex,
 };
@@ -418,6 +419,7 @@ impl Render for Notification {
         };
         let has_icon = icon.is_some();
         let placement = self.placement.unwrap_or(cx.theme().notification.placement);
+        let backdrop = OverlayBackdrop::active(cx);
 
         BaseToast::new("notification")
             .transition_status(transition_status)
@@ -429,6 +431,9 @@ impl Render for Notification {
             .border_1()
             .border_color(cx.theme().border)
             .bg(cx.theme().tokens.popover)
+            .when_some(backdrop, |surface, backdrop| {
+                surface.bg(backdrop.tint(cx.theme().tokens.popover))
+            })
             .rounded(cx.theme().radius_lg)
             .shadow(toast_shadow(1.))
             .py_3p5()
@@ -481,6 +486,7 @@ impl Render for Notification {
                     view.dismiss(window, cx);
                 }
             }))
+            .map(|surface| BackdropSurface::new(surface, backdrop))
             .with_animation(
                 ElementId::NamedInteger("slide-down".into(), closing as u64),
                 Animation::new(if closing {

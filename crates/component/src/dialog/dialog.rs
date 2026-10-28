@@ -17,6 +17,7 @@ use crate::{
     animation::cubic_bezier,
     button::{Button, ButtonVariant, ButtonVariants as _},
     dialog::{DialogContent, DialogDispatchAnchor, DialogTitle},
+    overlay_backdrop::{BackdropSurface, OverlayBackdrop},
     scroll::ScrollableElement as _,
     v_flex,
 };
@@ -673,6 +674,7 @@ impl RenderOnce for Dialog {
             (Anchor::TopLeft, y)
         };
         let y = y + layer_offset;
+        let backdrop = OverlayBackdrop::active(cx);
         let entrance = self.props.entrance;
         let motion = cx.theme().motion_tokens();
         let closing = self.motion.is_some_and(|motion| motion.closing);
@@ -777,6 +779,9 @@ impl RenderOnce for Dialog {
                                         .test_support()
                                         .debug_selector(move || format!("dialog-{layer_ix}"))
                                         .bg(cx.theme().tokens.background)
+                                        .when_some(backdrop, |surface, backdrop| {
+                                            surface.bg(backdrop.tint(cx.theme().tokens.background))
+                                        })
                                         .border_1()
                                         .border_color(cx.theme().border)
                                         .rounded(cx.theme().radius_lg)
@@ -891,8 +896,9 @@ impl RenderOnce for Dialog {
                                         // surface must apply opacity itself.
                                         .opacity(visibility)
                                         .shadow(dialog_shadow(visibility))
-                                        .text_selection_scope(selection_scope)
                                         .map(|surface| {
+                                            let surface = BackdropSurface::new(surface, backdrop)
+                                                .text_selection_scope(selection_scope);
                                             if entrance == DialogEntrance::FadeSlide {
                                                 let mut surface = EntranceSurface::new(
                                                     surface.into_any_element(),

@@ -2947,6 +2947,12 @@ impl Window {
         self.rendered_frame.scene.quads.clone()
     }
 
+    /// Returns the backdrop blurs in the most recently rendered frame's scene.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn painted_backdrop_blurs(&self) -> Vec<BackdropBlur> {
+        self.rendered_frame.scene.backdrop_blurs.clone()
+    }
+
     /// Returns the underlines in the most recently rendered frame's scene.
     #[cfg(any(test, feature = "test-support"))]
     pub fn painted_underlines(&self) -> Vec<Underline> {
@@ -4453,10 +4459,9 @@ impl Window {
             .unwrap_or_default()
     }
 
-    /// Obtain the current element opacity. This method should only be called during the
-    /// prepaint phase of element drawing.
+    /// Obtain the inherited element opacity during prepaint or paint.
     #[inline]
-    pub(crate) fn element_opacity(&self) -> f32 {
+    pub fn element_opacity(&self) -> f32 {
         self.invalidator.debug_assert_paint_or_prepaint();
         self.element_opacity
     }

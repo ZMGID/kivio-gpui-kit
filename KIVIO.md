@@ -3,7 +3,7 @@
 Fork of [longbridge/gpui-kit](https://github.com/longbridge/gpui-kit) used by [Kivio](https://github.com/ZMGID/kivio). Branch `kivio` starts at upstream `v0.8.1`.
 
 - `crates/`: gpui-kit 0.8.1, upstream layout.
-- `gpui-pre/`: the crates.io `gpui-pre*` **0.3.10** packages that Kivio patches, unpacked verbatim from their published `.crate` files (package names and versions unchanged).
+- `gpui-pre/`: the crates.io `gpui-pre*` **0.3.10** packages, initially unpacked verbatim from their published `.crate` files and patched here (package names and versions unchanged).
 
 Kivio consumes it through `[patch.crates-io]` pinned to a `rev` of this repo:
 
@@ -16,14 +16,36 @@ gpui-pre = { git = "https://github.com/ZMGID/kivio-gpui-kit", rev = "<rev>" }
 
 ## Patches
 
-Each patch is one commit with its own regression test. Implementations follow Zeron's GPUI fork ([zeronsh/zui](https://github.com/zeronsh/zui) `b564a344`, Apache-2.0) where noted. On a gpui-kit upgrade, rebase these commits and drop any that upstream now covers.
+Maintain each conceptual patch as a separate commit with regression coverage. Where noted, code is adapted from Zeron's Apache-2.0 GPUI fork [zeronsh/zui](https://github.com/zeronsh/zui) at `b564a34413bb7ef1da04121c4a287758f94993d9`. On a gpui-kit upgrade, rebase these commits and drop any that upstream now covers.
 
 | Patch | Packages | Reference | Commit |
 | --- | --- | --- | --- |
 | Sidebar keyboard navigation | `gpui-component` | Kit Base `Button` focus handling and GPUI native keyboard clicks | `Fix sidebar keyboard navigation` |
+| Image source eviction | `gpui-pre`, backend atlas tests | zui `crates/gpui/src/elements/img.rs`, `crates/gpui/src/app.rs` | `1b87590` |
+| Scoped edge fade | `gpui-pre`, `gpui-pre-windows`, `gpui-pre-apple`, `gpui-pre-wgpu` | zui scene/window and DirectX/Metal/WGPU shaders; paths below | `0bd0646` |
+| Backdrop blur | `gpui-pre`, `gpui-pre-windows`, `gpui-pre-apple`, `gpui-pre-wgpu` | zui scene/window and DirectX/Metal/WGPU renderers; paths below | `38e2968` |
+| Verbatim selection copy | `gpui-base`, Kit regression | Existing `TextSelection::selected_text`; remove trimming in Root and TextView | `94ead70` |
+| Windows tray hide/restore | `gpui-pre-windows` | Native `ShowWindowAsync`, preserving existing activation handling | `fix(windows): hide and restore windows for tray activation` |
 
 The sidebar patch starts from fork commit `e485b337f2ecb778cf3a5265488baf4dfaac663d`. It uses the existing `gpui-pre` 0.3.10 focus and click behavior, not code copied from Zeron. In the Kivio P1 Windows repro, Tab from the last gallery button skipped all sidebar destinations and wrapped to the first gallery button. The component regression tests exercise Tab, Enter and Space, disabled rows, retained focus, mouse clicks and submenu/caret behavior with `--features test-support`.
 
+### P2 rendering and image lifecycle
+
+- **Image eviction.** `ImageSource::evict(window, cx)` removes a `Resource` or `Image` from GPUI's default asset cache and drops the decoded image's atlas tiles in every window. Pass the currently updating window because it is temporarily absent from the app's window collection. A `Render` source drops its tiles without removing an asset; custom loaders and independently managed image caches remain the caller's responsibility. Eviction cancels pending default-cache loads without notifying subscribers or forcing a redraw; a later request starts a fresh load. The adaptation uses zui `crates/gpui/src/elements/img.rs` and `crates/gpui/src/app.rs`. Existing `CachedLoad` cancellation and stale-completion protections are retained. Regressions cover completed, failed and pending loads, replacement races, all animation frames, current/other windows, custom sources and GPU atlas re-upload.
+- **Edge fade.** `Window::with_edge_fade` scopes a four-edge fade in window coordinates. Active nested scopes temporarily replace and then restore the outer scope; `None` or an inactive fade leaves it unchanged. Bands are at least one logical pixel. Quads, glyphs and sprites evaluate the squared ramp per fragment; paths and shadows use conservative primitive opacity, and decorations use their origin. Adapted from zui `crates/gpui/src/{window.rs,scene.rs}`, `crates/gpui_windows/src/shaders.hlsl`, `crates/gpui_macos/src/shaders.metal`, and `crates/gpui_wgpu/src/{shaders.wgsl,shaders_subpixel.wgsl}`; the WebGL decoder was adapted for the local WGPU layout. The local fade record intentionally excludes P2.5 rounded-subtree clips and image alpha masks. Regressions exercise nested scopes, DPI scaling, primitive and shader ABI layouts, and backend GPU pixels.
+  Cached views compare prepaint and paint-time fade scopes. When a paint-only scope changes, affected views are redrawn before the provisional frame is presented; unchanged scopes retain cached paint.
+  The profiler records all retry passes as one draw with accumulated phase times and invalidations. Focus events, text-input configuration and accessibility updates are published only for the final pass.
+- **Backdrop blur.** `Window::paint_backdrop_blur(bounds, corners, radius)` composites a Gaussian-filtered snapshot of already-painted **window content**, inside the current rectangular content mask and rounded bounds; it does not blur the desktop behind a transparent window. Positive radius is a logical-pixel sigma, clamped after scaling to 1–64 device pixels. Invalid or nonpositive radii and invalid or empty geometry produce no scene operation. Scene ordering uses the padded sampling footprint and actual shadow geometry, and treats blur as a barrier even inside layers, so earlier sampled content and later sharp foreground retain their order. DirectX uses two GPU blur passes; Metal uses MPS Gaussian blur; WGPU renders to a copyable intermediate before GPU filtering and compositing, including on surfaces without copy-source support. DirectX and WGPU filter native pixels before reducing each axis and retain bounded scratch sets per downsample factor. Alpha, resize, device/resource lifetime and multiple blurs are handled by the renderers. This is distinct from the existing OS-level `WindowBackgroundAppearance::Blurred`.
+
+  The common scene and window code adapts zui `crates/gpui/src/{scene.rs,window.rs}`. DirectX adapts `crates/gpui_windows/{build.rs,src/directx_renderer.rs,src/directx_renderer/backdrop.rs,src/directx_renderer/backdrop_tests.rs,src/shaders.hlsl}`; Metal adapts `crates/gpui_macos/{build.rs,src/metal_renderer.rs,src/shaders.metal}`; WGPU adapts `crates/gpui_wgpu/src/{wgpu_renderer.rs,blur_kernel.rs,shaders.wgsl}`. `crates/kit/examples/backdrop_blur.rs` is adapted from zui `crates/gpui/examples/backdrop_blur.rs`. Scene regressions cover batch boundaries, nested layers, replay, clipping, invalid inputs and instance layout; backend regressions cover GPU pixels, ordering, alpha and resource lifetimes.
+  The WGPU path-composition regression also adapts zui `crates/gpui_windows/src/directx_renderer/backdrop_tests.rs`.
+
+The fork root `[patch.crates-io]` points its six vendored packages to local paths so workspace examples and tests exercise these changes rather than the published snapshots. Kivio's own workspace still supplies its pinned git patches. The example can be launched from the fork root with `cargo run -p gpui-kit --example backdrop_blur`; click its heading to compare blur and fade on and off. It shows nested blurred panels, sharp foreground and a four-edge fade.
+
+Windows verification: GPUI core with `test-support,profiler`: 491 passed, 2 ignored; DirectX WARP: 39 passed, including real pixel readback; Kit verbatim clipboard regression: 1 passed. The Kit offscreen rendering executable explicitly skips Windows rather than substituting a fake renderer. Native Kivio Dev release smoke verified close-to-tray and a second launch restoring the same primary HWND without starting another helper. macOS CI and Windows backdrop-example visual verification remain pending; macOS pixel behavior is not hardware-verified. Standalone `gpui-pre/*` manifests are excluded from the fork workspace and need an explicit `gpui-pre` path patch when testing a backend directly.
+
 Vendored packages: `gpui-pre`, `gpui-pre-platform`, `gpui-pre-windows`, `gpui-pre-macos`, `gpui-pre-apple`, `gpui-pre-wgpu`.
+
+Test prerequisites (`e658617`) restore the published core tests without the unpublished `util_macros::perf` dependency, use the existing IBM Plex Sans fixture, and restore `assets/fonts/lilex/Lilex-Regular.ttf` from the pinned zui reference above. Lilex is test-only and retains its accompanying SIL Open Font License in `assets/fonts/lilex/OFL.txt`; it is not part of the application's font bundle.
 
 Licensed under Apache-2.0, same as upstream (see `LICENSE-APACHE`).

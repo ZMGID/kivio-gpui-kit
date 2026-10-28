@@ -824,6 +824,8 @@ impl PlatformWindow for WindowsWindow {
                     // If the window is minimized, restore it.
                     if IsIconic(hwnd).as_bool() {
                         ShowWindowAsync(hwnd, SW_RESTORE).ok().log_err();
+                    } else if !IsWindowVisible(hwnd).as_bool() {
+                        ShowWindowAsync(hwnd, SW_SHOW).ok().log_err();
                     }
 
                     SetActiveWindow(hwnd).ok();

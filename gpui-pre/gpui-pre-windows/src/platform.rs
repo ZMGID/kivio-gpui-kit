@@ -702,7 +702,14 @@ impl Platform for WindowsPlatform {
 
     fn activate(&self, _ignoring_other_apps: bool) {}
 
-    fn hide(&self) {}
+    fn hide(&self) {
+        for window in self.raw_window_handles.read().iter() {
+            // Queue visibility changes so native callbacks do not reenter the borrowed App.
+            unsafe { ShowWindowAsync(window.as_raw(), SW_HIDE) }
+                .ok()
+                .log_err();
+        }
+    }
 
     // todo(windows)
     fn hide_other_apps(&self) {

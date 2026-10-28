@@ -359,7 +359,7 @@ mod tests {
     use usvg::fontdb::{Database, Family, Query};
 
     const IBM_PLEX_REGULAR: &[u8] =
-        include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf");
+        include_bytes!("../../../crates/story-web/fonts/IBMPlexSans-Regular.source.ttf");
     const LILEX_REGULAR: &[u8] = include_bytes!("../../../assets/fonts/lilex/Lilex-Regular.ttf");
 
     #[test]

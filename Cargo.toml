@@ -45,6 +45,15 @@ members = [
 exclude = ["gpui-pre"]
 resolver = "2"
 
+# Exercise the vendored renderer patches when building or testing this fork.
+[patch.crates-io]
+gpui-pre = { path = "gpui-pre/gpui-pre" }
+gpui-pre-platform = { path = "gpui-pre/gpui-pre-platform" }
+gpui-pre-windows = { path = "gpui-pre/gpui-pre-windows" }
+gpui-pre-macos = { path = "gpui-pre/gpui-pre-macos" }
+gpui-pre-apple = { path = "gpui-pre/gpui-pre-apple" }
+gpui-pre-wgpu = { path = "gpui-pre/gpui-pre-wgpu" }
+
 [workspace.package]
 publish = false
 edition = "2024"

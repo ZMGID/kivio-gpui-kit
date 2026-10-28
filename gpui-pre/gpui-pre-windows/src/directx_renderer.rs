@@ -29,6 +29,12 @@ const RENDER_TARGET_FORMAT: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM;
 const PATH_MULTISAMPLE_COUNT: u32 = 4;
 const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
 
+mod backdrop;
+use backdrop::BackdropResources;
+
+#[cfg(test)]
+mod backdrop_tests;
+
 pub(crate) struct FontInfo {
     pub gamma_ratios: [f32; 4],
     pub grayscale_enhanced_contrast: f32,
@@ -68,6 +74,8 @@ pub(crate) struct DirectXRendererDevices {
 }
 
 struct DirectXResources {
+    // Lazy, device-local snapshot and filtering resources.
+    backdrop: Option<BackdropResources>,
     // Direct3D rendering objects
     swap_chain: IDXGISwapChain1,
     render_target: Option<ID3D11Texture2D>,
@@ -357,12 +365,29 @@ impl DirectXRenderer {
         })?;
         self.upload_scene_buffers(scene)?;
 
+        let resources = self.resources.as_mut().context("resources missing")?;
+        if resources
+            .backdrop
+            .as_mut()
+            .is_some_and(|backdrop| backdrop.expire())
+        {
+            resources.backdrop = None;
+        }
+        let mut blurs = scene.backdrop_blurs.iter().peekable();
+
         let annotation = self
             .devices
             .as_ref()
             .and_then(|devices| devices.annotation.clone())
             .filter(|annotation| unsafe { annotation.GetStatus().as_bool() });
         for batch in scene.batches() {
+            // Batches split at blur orders; snapshot before primitives at that order.
+            if blurs.peek().is_some() {
+                let order = batch.first_order(scene);
+                while blurs.peek().is_some_and(|blur| blur.order <= order) {
+                    self.draw_backdrop_blur(blurs.next().unwrap())?;
+                }
+            }
             let _annotation = annotation
                 .as_ref()
                 .map(|annotation| Annotation::new(annotation, HSTRING::from(batch.label())));
@@ -400,6 +425,9 @@ impl DirectXRenderer {
                     scene.surfaces.len(),
                 )
             })?;
+        }
+        for blur in blurs {
+            self.draw_backdrop_blur(blur)?;
         }
         Ok(())
     }
@@ -495,6 +523,7 @@ impl DirectXRenderer {
         let devices = self.devices.as_ref().context("devices missing")?;
         unsafe { devices.device_context.OMSetRenderTargets(None, None) };
         let resources = self.resources.as_mut().context("resources missing")?;
+        resources.backdrop = None;
         resources.render_target.take();
         resources.render_target_view.take();
 
@@ -901,6 +930,7 @@ impl DirectXResources {
         set_rasterizer_state(&devices.device, &devices.device_context)?;
 
         Ok(Self {
+            backdrop: None,
             swap_chain,
             render_target: Some(render_target),
             render_target_view,
@@ -1708,6 +1738,8 @@ pub(crate) mod shader_resources {
 
     #[derive(Copy, Clone, Debug, Eq, PartialEq)]
     pub(crate) enum ShaderModule {
+        BackdropPass,
+        BackdropComposite,
         Quad,
         Shadow,
         Underline,
@@ -1758,6 +1790,14 @@ pub(crate) mod shader_resources {
         #[cfg(not(debug_assertions))]
         fn from_bytes(module: ShaderModule, target: ShaderTarget) -> Self {
             let bytes = match module {
+                ShaderModule::BackdropPass => match target {
+                    ShaderTarget::Vertex => BACKDROP_PASS_VERTEX_BYTES,
+                    ShaderTarget::Fragment => BACKDROP_PASS_FRAGMENT_BYTES,
+                },
+                ShaderModule::BackdropComposite => match target {
+                    ShaderTarget::Vertex => BACKDROP_COMPOSITE_VERTEX_BYTES,
+                    ShaderTarget::Fragment => BACKDROP_COMPOSITE_FRAGMENT_BYTES,
+                },
                 ShaderModule::Quad => match target {
                     ShaderTarget::Vertex => QUAD_VERTEX_BYTES,
                     ShaderTarget::Fragment => QUAD_FRAGMENT_BYTES,
@@ -1872,6 +1912,8 @@ pub(crate) mod shader_resources {
     impl ShaderModule {
         pub fn as_str(self) -> &'static str {
             match self {
+                ShaderModule::BackdropPass => "backdrop_pass",
+                ShaderModule::BackdropComposite => "backdrop_composite",
                 ShaderModule::Quad => "quad",
                 ShaderModule::Shadow => "shadow",
                 ShaderModule::Underline => "underline",

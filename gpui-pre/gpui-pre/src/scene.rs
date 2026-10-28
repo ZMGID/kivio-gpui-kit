@@ -15,6 +15,9 @@ use std::{
     slice,
 };
 
+#[cfg(test)]
+mod backdrop_tests;
+
 #[allow(non_camel_case_types, unused)]
 #[expect(missing_docs)]
 pub type PathVertex_ScaledPixels = PathVertex<ScaledPixels>;
@@ -41,7 +44,7 @@ impl From<bool> for PaddedBool32 {
 pub struct Scene {
     pub(crate) paint_operations: Vec<PaintOperation>,
     primitive_bounds: BoundsTree<ScaledPixels>,
-    layer_stack: Vec<DrawOrder>,
+    layer_stack: Vec<(Bounds<ScaledPixels>, Option<DrawOrder>)>,
     pub shadows: Vec<Shadow>,
     pub quads: Vec<Quad>,
     pub paths: Vec<Path<ScaledPixels>>,
@@ -50,6 +53,8 @@ pub struct Scene {
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
+    /// Blur operations interleave with primitive batches in draw order.
+    pub backdrop_blurs: Vec<BackdropBlur>,
 }
 
 #[expect(missing_docs)]
@@ -66,6 +71,7 @@ impl Scene {
         self.subpixel_sprites.clear();
         self.polychrome_sprites.clear();
         self.surfaces.clear();
+        self.backdrop_blurs.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -74,7 +80,7 @@ impl Scene {
 
     pub fn push_layer(&mut self, bounds: Bounds<ScaledPixels>) {
         let order = self.primitive_bounds.insert(bounds);
-        self.layer_stack.push(order);
+        self.layer_stack.push((bounds, Some(order)));
         self.paint_operations
             .push(PaintOperation::StartLayer(bounds));
     }
@@ -84,20 +90,63 @@ impl Scene {
         self.paint_operations.push(PaintOperation::EndLayer);
     }
 
+    pub fn insert_backdrop_blur(&mut self, mut blur: BackdropBlur) {
+        if !blur.is_valid() {
+            return;
+        }
+        let clipped_bounds = blur.bounds.intersect(&blur.content_mask.bounds);
+        if clipped_bounds.is_empty() {
+            return;
+        }
+        blur.blur_radius.0 = blur.blur_radius.0.clamp(1., 64.);
+        let padding = (blur.blur_radius.0 * 3.).ceil() + 2.;
+        let sampling_bounds = Bounds::from_corners(
+            point(
+                ScaledPixels((clipped_bounds.left().0 - padding).floor()),
+                ScaledPixels((clipped_bounds.top().0 - padding).floor()),
+            ),
+            point(
+                ScaledPixels((clipped_bounds.right().0 + padding).ceil()),
+                ScaledPixels((clipped_bounds.bottom().0 + padding).ceil()),
+            ),
+        );
+        blur.order = self.primitive_bounds.insert(sampling_bounds);
+        // Later paints in every active layer must be ordered against the snapshot.
+        self.layer_stack
+            .iter_mut()
+            .for_each(|(_, order)| *order = None);
+        self.backdrop_blurs.push(blur);
+        self.paint_operations
+            .push(PaintOperation::BackdropBlur(blur));
+    }
+
     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
         let mut primitive = primitive.into();
-        let clipped_bounds = primitive
-            .bounds()
-            .intersect(&primitive.content_mask().bounds);
+        let bounds = match &primitive {
+            Primitive::Shadow(shadow) if shadow.inset != 0 => shadow.element_bounds,
+            Primitive::Shadow(shadow) => shadow
+                .bounds
+                .dilate(ScaledPixels(3. * shadow.blur_radius.0)),
+            _ => *primitive.bounds(),
+        };
+        let clipped_bounds = bounds.intersect(&primitive.content_mask().bounds);
 
         if clipped_bounds.is_empty() {
             return;
         }
 
+        // Paint outside a layer's declared bounds needs its own spatial entry.
         let order = self
             .layer_stack
             .last()
-            .copied()
+            .and_then(|(bounds, order)| {
+                (*order).filter(|_| {
+                    clipped_bounds.left() >= bounds.left()
+                        && clipped_bounds.top() >= bounds.top()
+                        && clipped_bounds.right() <= bounds.right()
+                        && clipped_bounds.bottom() <= bounds.bottom()
+                })
+            })
             .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds));
         match &mut primitive {
             Primitive::Shadow(shadow) => {
@@ -142,6 +191,7 @@ impl Scene {
         for operation in &prev_scene.paint_operations[range] {
             match operation {
                 PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
+                PaintOperation::BackdropBlur(blur) => self.insert_backdrop_blur(*blur),
                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
                 PaintOperation::EndLayer => self.pop_layer(),
             }
@@ -160,6 +210,7 @@ impl Scene {
         self.polychrome_sprites
             .sort_by_key(|sprite| (sprite.order, sprite.tile.texture_id.index));
         self.surfaces.sort_by_key(|surface| surface.order);
+        self.backdrop_blurs.sort_by_key(|blur| blur.order);
     }
 
     #[cfg_attr(
@@ -187,6 +238,7 @@ impl Scene {
             polychrome_sprites_iter: self.polychrome_sprites.iter().peekable(),
             surfaces_start: 0,
             surfaces_iter: self.surfaces.iter().peekable(),
+            backdrop_blurs_iter: self.backdrop_blurs.iter().peekable(),
         }
     }
 }
@@ -213,6 +265,7 @@ pub(crate) enum PrimitiveKind {
 
 pub(crate) enum PaintOperation {
     Primitive(Primitive),
+    BackdropBlur(BackdropBlur),
     StartLayer(Bounds<ScaledPixels>),
     EndLayer,
 }
@@ -283,6 +336,7 @@ struct BatchIterator<'a> {
     polychrome_sprites_iter: Peekable<slice::Iter<'a, PolychromeSprite>>,
     surfaces_start: usize,
     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
+    backdrop_blurs_iter: Peekable<slice::Iter<'a, BackdropBlur>>,
 }
 
 impl<'a> Iterator for BatchIterator<'a> {
@@ -321,11 +375,21 @@ impl<'a> Iterator for BatchIterator<'a> {
 
         let first = orders_and_kinds[0];
         let second = orders_and_kinds[1];
-        let (batch_kind, max_order_and_kind) = if first.0.is_some() {
+        let (batch_kind, mut max_order_and_kind) = if first.0.is_some() {
             (first.1, (second.0.unwrap_or(u32::MAX), second.1))
         } else {
             return None;
         };
+
+        // Each backend composites blur before primitives at the same order.
+        while self
+            .backdrop_blurs_iter
+            .next_if(|blur| blur.order <= first.0.unwrap())
+            .is_some()
+        {}
+        if let Some(blur) = self.backdrop_blurs_iter.peek() {
+            max_order_and_kind = max_order_and_kind.min((blur.order, PrimitiveKind::Shadow));
+        }
 
         match batch_kind {
             PrimitiveKind::Shadow => {
@@ -496,6 +560,20 @@ pub enum PrimitiveBatch {
 }
 
 impl PrimitiveBatch {
+    /// The first order represented by this nonempty batch.
+    pub fn first_order(&self, scene: &Scene) -> DrawOrder {
+        match self {
+            Self::Shadows(range) => scene.shadows[range.start].order,
+            Self::Quads(range) => scene.quads[range.start].order,
+            Self::Paths(range) => scene.paths[range.start].order,
+            Self::Underlines(range) => scene.underlines[range.start].order,
+            Self::MonochromeSprites { range, .. } => scene.monochrome_sprites[range.start].order,
+            Self::SubpixelSprites { range, .. } => scene.subpixel_sprites[range.start].order,
+            Self::PolychromeSprites { range, .. } => scene.polychrome_sprites[range.start].order,
+            Self::Surfaces(range) => scene.surfaces[range.start].order,
+        }
+    }
+
     #[expect(missing_docs)]
     pub fn label(&self) -> String {
         match self {
@@ -582,6 +660,48 @@ pub struct Underline {
 impl From<Underline> for Primitive {
     fn from(underline: Underline) -> Self {
         Primitive::Underline(underline)
+    }
+}
+/// A within-window Gaussian backdrop, composited before primitives at its order.
+#[derive(Debug, Copy, Clone)]
+#[repr(C)]
+#[expect(missing_docs)]
+pub struct BackdropBlur {
+    pub order: DrawOrder,
+    pub blur_radius: ScaledPixels,
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+    pub corner_radii: Corners<ScaledPixels>,
+}
+
+impl BackdropBlur {
+    pub(crate) fn is_valid(&self) -> bool {
+        let valid_bounds = |bounds: Bounds<ScaledPixels>| {
+            [
+                bounds.origin.x.0,
+                bounds.origin.y.0,
+                bounds.size.width.0,
+                bounds.size.height.0,
+                bounds.right().0,
+                bounds.bottom().0,
+            ]
+            .iter()
+            .all(|value| value.is_finite())
+                && bounds.size.width.0 > 0.
+                && bounds.size.height.0 > 0.
+        };
+        self.blur_radius.0.is_finite()
+            && self.blur_radius.0 > 0.
+            && valid_bounds(self.bounds)
+            && valid_bounds(self.content_mask.bounds)
+            && [
+                self.corner_radii.top_left.0,
+                self.corner_radii.top_right.0,
+                self.corner_radii.bottom_right.0,
+                self.corner_radii.bottom_left.0,
+            ]
+            .iter()
+            .all(|radius| radius.is_finite() && *radius >= 0.)
     }
 }
 

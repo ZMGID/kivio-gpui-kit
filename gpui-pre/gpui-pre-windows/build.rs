@@ -32,6 +32,8 @@ mod shader_compilation {
 
         // Define all modules
         let modules = [
+            "backdrop_pass",
+            "backdrop_composite",
             "quad",
             "shadow",
             "path_rasterization",

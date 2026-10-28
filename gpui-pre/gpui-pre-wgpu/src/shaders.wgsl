@@ -1394,3 +1394,104 @@ fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
 
     return ycbcr_to_RGB * y_cb_cr;
 }
+
+// Adapted from zui crates/gpui_wgpu/src/shaders.wgsl: backdrop blur.
+struct BlurPassParams {
+    direction: vec2<f32>,
+    sigma: f32,
+    downsample: f32,
+    source_texel_size: vec2<f32>,
+    padding: vec2<f32>,
+    weights: array<vec4<f32>, 49>,
+}
+
+@group(1) @binding(0) var<uniform> b_blur_pass: BlurPassParams;
+@group(1) @binding(1) var t_blur_source: texture_2d<f32>;
+@group(1) @binding(2) var s_blur_source: sampler;
+
+struct BlurPassVarying {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+}
+
+@vertex
+fn vs_blur_pass(@builtin(vertex_index) vertex_id: u32) -> BlurPassVarying {
+    let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+    var out = BlurPassVarying();
+    out.position = vec4<f32>(unit_vertex * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0), 0.0, 1.0);
+    out.uv = unit_vertex;
+    return out;
+}
+
+@fragment
+fn fs_blur_pass(input: BlurPassVarying) -> @location(0) vec4<f32> {
+    let params = b_blur_pass;
+    let sigma = clamp(params.sigma, 0.5, 64.0);
+    let radius = min(i32(ceil(sigma * 3.0)), 192);
+    let step = params.direction * params.source_texel_size;
+    let base = input.uv;
+    var sum = vec4<f32>(0.0);
+    // Paired linear taps are exact only when the source texels are aligned.
+    if (params.downsample == 1.0) {
+        sum = textureSampleLevel(t_blur_source, s_blur_source, base, 0.0) * b_blur_pass.weights[0].x;
+        for (var k = 1; k <= radius; k += 2) {
+            let first = u32(k);
+            let second = first + 1u;
+            let a = b_blur_pass.weights[first / 4u][first % 4u];
+            let b = b_blur_pass.weights[second / 4u][second % 4u];
+            let weight = a + b;
+            let offset = (f32(k) + b / weight) * step;
+            sum += textureSampleLevel(t_blur_source, s_blur_source, base + offset, 0.0) * weight;
+            sum += textureSampleLevel(t_blur_source, s_blur_source, base - offset, 0.0) * weight;
+        }
+        return sum;
+    }
+    for (var k = -radius; k <= radius; k++) {
+        let ix = u32(abs(k));
+        let weight = b_blur_pass.weights[ix / 4u][ix % 4u];
+        sum += textureSampleLevel(t_blur_source, s_blur_source, base + f32(k) * step, 0.0) * weight;
+    }
+    return sum;
+}
+
+struct BackdropBlurParams {
+    bounds: Bounds,
+    corner_radii: Corners,
+    clip_bounds: Bounds,
+    source_rect: vec4<f32>,
+}
+
+@group(1) @binding(0) var<uniform> b_backdrop_blur: BackdropBlurParams;
+@group(1) @binding(1) var t_backdrop_blurred: texture_2d<f32>;
+@group(1) @binding(2) var s_backdrop_blurred: sampler;
+
+struct BackdropBlurVarying {
+    @builtin(position) position: vec4<f32>,
+    @location(0) device_position: vec2<f32>,
+    @location(1) clip_distances: vec4<f32>,
+}
+
+@vertex
+fn vs_backdrop_blur(@builtin(vertex_index) vertex_id: u32) -> BackdropBlurVarying {
+    let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+    let params = b_backdrop_blur;
+    var out = BackdropBlurVarying();
+    out.position = to_device_position(unit_vertex, params.bounds);
+    out.device_position = unit_vertex * vec2<f32>(params.bounds.size) + params.bounds.origin;
+    out.clip_distances = distance_from_clip_rect(unit_vertex, params.bounds, params.clip_bounds);
+    return out;
+}
+
+@fragment
+fn fs_backdrop_blur(input: BackdropBlurVarying) -> @location(0) vec4<f32> {
+    // This pass replaces pixels, so clipping must discard rather than blend zero.
+    if (any(input.clip_distances < vec4<f32>(0.0))) {
+        discard;
+    }
+    let params = b_backdrop_blur;
+    if (quad_sdf(input.device_position, params.bounds, params.corner_radii) > 0.0) {
+        discard;
+    }
+    let uv = (input.device_position - params.source_rect.xy) / params.source_rect.zw;
+    return textureSampleLevel(t_backdrop_blurred, s_backdrop_blurred, uv, 0.0);
+}

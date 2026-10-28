@@ -6,8 +6,8 @@ use crate::Inspector;
 use crate::profiler;
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
-    AsyncWindowContext, AtlasTile, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow,
-    Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
+    AsyncWindowContext, AtlasTile, AvailableSpace, BackdropBlur, Background, BorderStyle, Bounds,
+    BoxShadow, Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
     Hsla, InputHandler, InputPreference, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
@@ -4873,6 +4873,47 @@ impl Window {
         }
     }
 
+    /// Blur already-painted window content within the rounded bounds.
+    ///
+    /// The radius is a Gaussian sigma in logical pixels, limited to 1–64
+    /// device pixels after scaling. Nonpositive or invalid geometry is ignored.
+    /// Paint foreground after this call. Use a separate [`Self::paint_layer`]
+    /// for nested backdrops so each captures the content beneath it.
+    pub fn paint_backdrop_blur(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        blur_radius: Pixels,
+    ) {
+        self.invalidator.debug_assert_paint();
+        let scale = self.scale_factor();
+        let blur = BackdropBlur {
+            order: 0,
+            blur_radius: blur_radius.scale(scale),
+            bounds: self.snap_bounds(bounds),
+            content_mask: self.snapped_content_mask(),
+            corner_radii: corner_radii.scale(scale),
+        };
+        if !blur.is_valid() || blur.bounds.intersect(&blur.content_mask.bounds).is_empty() {
+            return;
+        }
+
+        // A transparent splitter reserves a draw order before the snapshot.
+        self.next_frame.scene.insert_primitive(Shadow {
+            order: 0,
+            blur_radius: ScaledPixels(0.),
+            bounds: blur.bounds,
+            corner_radii: blur.corner_radii,
+            content_mask: blur.content_mask,
+            color: transparent_black(),
+            element_bounds: blur.bounds,
+            element_corner_radii: blur.corner_radii,
+            inset: 0,
+            pad: 0,
+        });
+        self.next_frame.scene.insert_backdrop_blur(blur);
+    }
+
     fn largest_border_interior(quad: &Quad) -> Bounds<ScaledPixels> {
         let radii = &quad.corner_radii;
         let widths = &quad.border_widths;
@@ -8152,13 +8193,13 @@ mod tests {
 
     use crate::{
         AnyWindowHandle, AppContext as _, BackGestureEvent, BackGesturePhase, Bounds, ContentMask,
-        Context, DispatchPhase, DragMoveEvent, Empty, ExternalDragPayload, ExternalPaths,
+        Context, Corners, DispatchPhase, DragMoveEvent, Empty, ExternalDragPayload, ExternalPaths,
         FileDragPaths, FileDropEvent, FocusHandle, InputEvent as _, InteractiveElement as _,
         IntoElement, KeyDownEvent, Keystroke, LongPressEvent, MouseButton, MouseDownEvent,
         MouseMoveEvent, ParentElement, Pixels, PlatformInput, Point, Render, RequestFrameOptions,
         ScaledPixels, StatefulInteractiveElement as _, Styled, TestAppContext, TouchDragEvent,
         TouchEvent, TouchId, TouchPhase, Underline, UnderlineStyle, Window, WindowAppearance,
-        WindowOptions, canvas, div, hsla, point, px, size,
+        WindowOptions, canvas, div, hsla, point, px, size, transparent_black,
     };
 
     #[gpui::test]
@@ -9787,6 +9828,36 @@ mod tests {
             assert_eq!(sprites[0].opacity, 0.5);
             assert_eq!(window.edge_fade, None);
             assert_eq!(window.element_opacity(), 1.);
+        });
+    }
+
+    #[gpui::test]
+    fn backdrop_blur_records_scaled_geometry_and_rejects_invisible_operations(
+        cx: &mut TestAppContext,
+    ) {
+        test_underline_paint_at_scales(cx, |window| {
+            let bounds = Bounds::new(point(px(10.25), px(20.5)), size(px(80.), px(50.)));
+            let corners = Corners::all(px(4.));
+            let scale = window.scale_factor();
+            window.next_frame.scene.clear();
+            window.paint_backdrop_blur(bounds, corners, px(10.));
+            let scene = &window.next_frame.scene;
+            assert_eq!(scene.backdrop_blurs.len(), 1);
+            assert_eq!(scene.shadows.len(), 1);
+            let blur = scene.backdrop_blurs[0];
+            assert_eq!(blur.bounds, window.snap_bounds(bounds));
+            assert_eq!(blur.content_mask, window.snapped_content_mask());
+            assert_eq!(blur.corner_radii, corners.scale(scale));
+            assert_eq!(blur.blur_radius, ScaledPixels((10. * scale).clamp(1., 64.)));
+            assert_eq!(scene.shadows[0].color, transparent_black());
+
+            window.next_frame.scene.clear();
+            window.paint_backdrop_blur(bounds, corners, px(0.));
+            window.paint_backdrop_blur(bounds, corners, px(f32::NAN));
+            let outside = Bounds::new(point(px(2000.), px(2000.)), size(px(20.), px(20.)));
+            window.paint_backdrop_blur(outside, corners, px(10.));
+            assert_eq!(window.next_frame.scene.len(), 0);
+            assert!(window.next_frame.scene.backdrop_blurs.is_empty());
         });
     }
 

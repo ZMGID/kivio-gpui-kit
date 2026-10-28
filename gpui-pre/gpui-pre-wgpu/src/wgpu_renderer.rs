@@ -1,11 +1,16 @@
 // Modified for gpui-pre (snapshot of zed@08cbb88): adapt device queues and sRGB detection to wgpu 30.0.1.
+#[path = "backdrop.rs"]
+mod backdrop;
+#[path = "blur_kernel.rs"]
+mod blur_kernel;
+
 use crate::{CompositorGpuHint, DeviceErrorState, WgpuAtlas, WgpuContext};
 use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
 use collections::FxHashMap;
 use gpui::{
-    AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, Path, Point, PrimitiveBatch,
-    ScaledPixels, Scene, Size, get_gamma_correction_ratios,
+    AtlasTextureId, BackdropBlur, Background, Bounds, DevicePixels, GpuSpecs, Path, Point,
+    PrimitiveBatch, ScaledPixels, Scene, Size, get_gamma_correction_ratios,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -97,6 +102,46 @@ struct GammaParams {
     _pad: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct BlurPassUniform {
+    direction: [f32; 2],
+    sigma: f32,
+    downsample: f32,
+    source_texel_size: [f32; 2],
+    padding: [f32; 2],
+    weights: [[f32; 4]; blur_kernel::KERNEL_VECTORS],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct BackdropBlurUniform {
+    bounds: PodBounds,
+    corner_radii: [f32; 4],
+    clip_bounds: PodBounds,
+    source_rect: [f32; 4],
+}
+
+#[derive(Clone)]
+struct BackdropScratch {
+    width: u32,
+    height: u32,
+    blur_width: u32,
+    blur_height: u32,
+    snapshot: wgpu::Texture,
+    snapshot_view: wgpu::TextureView,
+    blur_a_view: wgpu::TextureView,
+    blur_b_view: wgpu::TextureView,
+}
+
+struct BackdropFrame {
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    blitter: wgpu::util::TextureBlitter,
+}
+
+const SCRATCH_RELEASE_AFTER_FRAMES: u32 = 30;
+
 #[derive(Clone, Debug)]
 #[repr(C)]
 struct PathSprite {
@@ -135,6 +180,8 @@ struct WgpuPipelines {
     poly_sprites: wgpu::RenderPipeline,
     #[allow(dead_code)]
     surfaces: wgpu::RenderPipeline,
+    backdrop_blur_pass: wgpu::RenderPipeline,
+    backdrop_composite: wgpu::RenderPipeline,
 }
 
 /// One frame allocation of instance data, ready to bind.
@@ -162,6 +209,7 @@ struct WgpuBindGroupLayouts {
     instances: wgpu::BindGroupLayout,
     texture: wgpu::BindGroupLayout,
     surfaces: wgpu::BindGroupLayout,
+    backdrop: wgpu::BindGroupLayout,
 }
 
 /// Shared GPU context reference, used to coordinate device recovery across multiple windows.
@@ -195,6 +243,10 @@ struct WgpuResources {
     path_intermediate_view: Option<wgpu::TextureView>,
     path_msaa_texture: Option<wgpu::Texture>,
     path_msaa_view: Option<wgpu::TextureView>,
+    backdrop_sampler: wgpu::Sampler,
+    backdrop_params: Option<wgpu::Buffer>,
+    backdrop_scratch: [Option<BackdropScratch>; 4],
+    backdrop_frame: Option<BackdropFrame>,
 }
 
 struct CachedTextureBindGroup {
@@ -208,6 +260,8 @@ impl WgpuResources {
         self.path_intermediate_view = None;
         self.path_msaa_texture = None;
         self.path_msaa_view = None;
+        self.backdrop_scratch = std::array::from_fn(|_| None);
+        self.backdrop_frame = None;
     }
 }
 
@@ -226,6 +280,8 @@ struct WgpuRendererCore {
     adapter_info: wgpu::AdapterInfo,
     target_format: wgpu::TextureFormat,
     max_texture_size: u32,
+    backdrop_slot_stride: u64,
+    blur_free_frames: u32,
 }
 
 /// GPU resources of a windowed renderer. A surface is only ever configured against the
@@ -616,11 +672,44 @@ impl WgpuRendererCore {
             ],
         });
 
+        let backdrop = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("backdrop_layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
         WgpuBindGroupLayouts {
             globals,
             instances,
             texture,
             surfaces,
+            backdrop,
         }
     }
 
@@ -925,6 +1014,36 @@ impl WgpuRendererCore {
             &shader_module,
         );
 
+        let backdrop_target = wgpu::ColorTargetState {
+            format: surface_format,
+            blend: None,
+            write_mask: wgpu::ColorWrites::ALL,
+        };
+        let backdrop_blur_pass = create_pipeline(
+            "backdrop_blur_pass",
+            "vs_blur_pass",
+            "fs_blur_pass",
+            &layouts.globals,
+            &layouts.backdrop,
+            None,
+            wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(backdrop_target.clone())],
+            1,
+            &shader_module,
+        );
+        let backdrop_composite = create_pipeline(
+            "backdrop_composite",
+            "vs_backdrop_blur",
+            "fs_backdrop_blur",
+            &layouts.globals,
+            &layouts.backdrop,
+            None,
+            wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(backdrop_target)],
+            1,
+            &shader_module,
+        );
+
         WgpuPipelines {
             quads,
             shadows,
@@ -935,6 +1054,8 @@ impl WgpuRendererCore {
             subpixel_sprites,
             poly_sprites,
             surfaces,
+            backdrop_blur_pass,
+            backdrop_composite,
         }
     }
 
@@ -1236,7 +1357,18 @@ impl WgpuRendererCore {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
+        let backdrop_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("backdrop_sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            ..Default::default()
+        });
         let uniform_alignment = device.limits().min_uniform_buffer_offset_alignment as u64;
+        let backdrop_slot_stride = (std::mem::size_of::<BlurPassUniform>() as u64)
+            .max(std::mem::size_of::<BackdropBlurUniform>() as u64)
+            .next_multiple_of(uniform_alignment);
         let globals_size = std::mem::size_of::<GlobalParams>() as u64;
         let gamma_size = std::mem::size_of::<GammaParams>() as u64;
         let path_globals_offset = globals_size.next_multiple_of(uniform_alignment);
@@ -1348,6 +1480,10 @@ impl WgpuRendererCore {
                 path_intermediate_view: None,
                 path_msaa_texture: None,
                 path_msaa_view: None,
+                backdrop_sampler,
+                backdrop_params: None,
+                backdrop_scratch: std::array::from_fn(|_| None),
+                backdrop_frame: None,
             },
             atlas,
             path_globals_offset,
@@ -1362,6 +1498,8 @@ impl WgpuRendererCore {
             adapter_info: context.adapter.get_info(),
             target_format,
             max_texture_size,
+            backdrop_slot_stride,
+            blur_free_frames: 0,
         }
     }
 
@@ -1430,6 +1568,7 @@ impl WgpuRendererCore {
 
         self.atlas.before_frame();
         self.ensure_intermediate_textures(size);
+        self.prepare_backdrop(size, scene.backdrop_blurs.len())?;
 
         let gamma_params = GammaParams {
             gamma_ratios: self.rendering_params.gamma_ratios,
@@ -1463,17 +1602,35 @@ impl WgpuRendererCore {
             bytemuck::bytes_of(&gamma_params),
         );
 
-        self.record_frame(scene, target_view, clear_color)
-            .inspect_err(|_| {
-                // Queue writes are staged before encoding; flush them even if the frame fails.
-                self.resources.queue.submit(std::iter::empty());
-            })
+        let (frame_texture, frame_view) = if scene.backdrop_blurs.is_empty() {
+            (None, target_view.clone())
+        } else {
+            let frame = self
+                .resources
+                .backdrop_frame
+                .as_ref()
+                .expect("backdrop frame prepared");
+            (Some(frame.texture.clone()), frame.view.clone())
+        };
+        self.record_frame(
+            scene,
+            &frame_view,
+            frame_texture.as_ref(),
+            target_view,
+            clear_color,
+        )
+        .inspect_err(|_| {
+            // Queue writes are staged before encoding; flush them even if the frame fails.
+            self.resources.queue.submit(std::iter::empty());
+        })
     }
 
     fn record_frame(
         &mut self,
         scene: &Scene,
         frame_view: &wgpu::TextureView,
+        frame_texture: Option<&wgpu::Texture>,
+        target_view: &wgpu::TextureView,
         clear_color: wgpu::Color,
     ) -> Result<wgpu::SubmissionIndex> {
         let mut instance_offset = 0;
@@ -1516,7 +1673,27 @@ impl WgpuRendererCore {
                 ..Default::default()
             });
 
-            for batch in scene.batches() {
+            let mut pending_blurs = scene.backdrop_blurs.iter().enumerate().peekable();
+            for batch in scene.batches().map(Some).chain(std::iter::once(None)) {
+                while pending_blurs.peek().is_some_and(|(_, blur)| {
+                    batch
+                        .as_ref()
+                        .is_none_or(|batch| blur.order <= batch.first_order(scene))
+                }) {
+                    let (slot, blur) = pending_blurs.next().unwrap();
+                    drop(pass);
+                    let scratch_index = self.process_backdrop_blur(
+                        &mut encoder,
+                        frame_texture.expect("backdrop frame prepared"),
+                        blur,
+                        slot,
+                    );
+                    pass = Self::continue_main_pass(&mut encoder, frame_view);
+                    if let Some(scratch_index) = scratch_index {
+                        self.draw_backdrop_composite(slot, scratch_index, &mut pass);
+                    }
+                }
+                let Some(batch) = batch else { break };
                 match batch {
                     PrimitiveBatch::Quads(range) => self.draw_instances(
                         &instance_bindings.quads,
@@ -1543,20 +1720,7 @@ impl WgpuRendererCore {
                             &mut instance_offset,
                         )?;
 
-                        pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                            label: Some("main_pass_continued"),
-                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                view: frame_view,
-                                resolve_target: None,
-                                ops: wgpu::Operations {
-                                    load: wgpu::LoadOp::Load,
-                                    store: wgpu::StoreOp::Store,
-                                },
-                                depth_slice: None,
-                            })],
-                            depth_stencil_attachment: None,
-                            ..Default::default()
-                        });
+                        pass = Self::continue_main_pass(&mut encoder, frame_view);
 
                         if rasterized {
                             self.draw_paths_from_intermediate(
@@ -1609,6 +1773,20 @@ impl WgpuRendererCore {
                     PrimitiveBatch::Surfaces(_surfaces) => {}
                 }
             }
+        }
+
+        if frame_texture.is_some() {
+            let frame = self
+                .resources
+                .backdrop_frame
+                .as_ref()
+                .expect("backdrop frame prepared");
+            frame.blitter.copy(
+                &self.resources.device,
+                &mut encoder,
+                frame_view,
+                target_view,
+            );
         }
 
         let submission = self
@@ -2615,6 +2793,7 @@ mod tests {
     };
     #[cfg(target_os = "linux")]
     use gpui::{DevicePixels, PlatformHeadlessRenderer, Scene};
+    use wgpu::naga;
 
     #[cfg(target_os = "linux")]
     fn device_size(width: i32, height: i32) -> Size<DevicePixels> {
@@ -2645,6 +2824,7 @@ mod tests {
             border_color: color,
             corner_radii: Corners::default(),
             border_widths: Edges::default(),
+            fade: Default::default(),
         }
     }
 
@@ -2767,6 +2947,58 @@ mod tests {
     }
 
     #[test]
+    fn backdrop_uniforms_match_wgsl_layout() {
+        for source in [STORAGE_BUFFER_SHADERS, WEBGL_SHADERS] {
+            let module = naga::front::wgsl::parse_str(source).unwrap();
+            let layout = |name: &str| {
+                let ty = module
+                    .types
+                    .iter()
+                    .find(|(_, ty)| ty.name.as_deref() == Some(name))
+                    .unwrap()
+                    .1;
+                match &ty.inner {
+                    naga::TypeInner::Struct { members, span } => (
+                        members
+                            .iter()
+                            .map(|member| member.offset as usize)
+                            .collect::<Vec<_>>(),
+                        *span as usize,
+                    ),
+                    _ => panic!("{name} is not a struct"),
+                }
+            };
+            assert_eq!(
+                layout("BlurPassParams"),
+                (
+                    vec![
+                        std::mem::offset_of!(BlurPassUniform, direction),
+                        std::mem::offset_of!(BlurPassUniform, sigma),
+                        std::mem::offset_of!(BlurPassUniform, downsample),
+                        std::mem::offset_of!(BlurPassUniform, source_texel_size),
+                        std::mem::offset_of!(BlurPassUniform, padding),
+                        std::mem::offset_of!(BlurPassUniform, weights),
+                    ],
+                    std::mem::size_of::<BlurPassUniform>(),
+                )
+            );
+            assert_eq!(
+                layout("BackdropBlurParams"),
+                (
+                    vec![
+                        std::mem::offset_of!(BackdropBlurUniform, bounds),
+                        std::mem::offset_of!(BackdropBlurUniform, corner_radii),
+                        std::mem::offset_of!(BackdropBlurUniform, clip_bounds),
+                        std::mem::offset_of!(BackdropBlurUniform, source_rect),
+                    ],
+                    std::mem::size_of::<BackdropBlurUniform>(),
+                )
+            );
+        }
+        assert_eq!(std::mem::size_of::<BlurPassUniform>(), 816);
+    }
+
+    #[test]
     fn webgl_shader_is_valid_wgsl_without_storage_buffers() {
         assert!(!WEBGL_SHADERS.contains("var<storage"));
         validate_wgsl(WEBGL_SHADERS, naga::valid::Capabilities::empty());
@@ -2794,14 +3026,14 @@ mod tests {
 
     #[test]
     fn webgl_record_sizes_match_shader_word_strides() {
-        assert_eq!(std::mem::size_of::<Quad>(), 40 * 4);
+        assert_eq!(std::mem::size_of::<Quad>(), 48 * 4);
         assert_eq!(std::mem::size_of::<Shadow>(), 28 * 4);
         assert_eq!(std::mem::size_of::<PathRasterizationVertex>(), 26 * 4);
         assert_eq!(std::mem::size_of::<PathSprite>(), 4 * 4);
         assert_eq!(std::mem::size_of::<Underline>(), 16 * 4);
-        assert_eq!(std::mem::size_of::<MonochromeSprite>(), 28 * 4);
-        assert_eq!(std::mem::size_of::<SubpixelSprite>(), 28 * 4);
-        assert_eq!(std::mem::size_of::<PolychromeSprite>(), 24 * 4);
+        assert_eq!(std::mem::size_of::<MonochromeSprite>(), 36 * 4);
+        assert_eq!(std::mem::size_of::<SubpixelSprite>(), 36 * 4);
+        assert_eq!(std::mem::size_of::<PolychromeSprite>(), 32 * 4);
     }
 
     #[test]
@@ -2871,6 +3103,16 @@ mod tests {
                 bottom: 32.0.into(),
                 left: 33.0.into(),
             },
+            fade: gpui::EdgeFadeParams {
+                top_y: 34.0,
+                bottom_y: 35.0,
+                band_top: 36.0,
+                band_bottom: 37.0,
+                left_x: 38.0,
+                right_x: 39.0,
+                band_left: 40.0,
+                band_right: 41.0,
+            },
         };
 
         let bytes = unsafe { WgpuRendererCore::instance_bytes(std::slice::from_ref(&quad)) };
@@ -2918,7 +3160,19 @@ mod tests {
                 31.0_f32.to_bits(),
                 32.0_f32.to_bits(),
                 33.0_f32.to_bits(),
+                34.0_f32.to_bits(),
+                35.0_f32.to_bits(),
+                36.0_f32.to_bits(),
+                37.0_f32.to_bits(),
+                38.0_f32.to_bits(),
+                39.0_f32.to_bits(),
+                40.0_f32.to_bits(),
+                41.0_f32.to_bits(),
             ]
         );
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "backdrop_tests.rs"]
+mod backdrop_tests;

@@ -844,18 +844,8 @@ impl MetalRenderer {
                 }
                 PrimitiveBatch::Paths(range) => {
                     let mut paths = &scene.paths[range];
-                    while let Some(first) = paths.first() {
-                        // A clipped path must not sample another path's rasterized pixels.
-                        // Preserve the existing fast batch for consecutive unclipped paths.
-                        let count = if first.clip.right > first.clip.left {
-                            1
-                        } else {
-                            paths
-                                .iter()
-                                .position(|path| path.clip.right > path.clip.left)
-                                .unwrap_or(paths.len())
-                        };
-                        let (group, remaining) = paths.split_at(count);
+                    while !paths.is_empty() {
+                        let (group, remaining) = gpui::split_path_batch(paths);
                         command_encoder.end_encoding();
 
                         let did_draw = self.draw_paths_to_intermediate(
@@ -1314,27 +1304,20 @@ impl MetalRenderer {
             Some(intermediate_texture),
         );
 
-        // Clipped paths arrive individually. Unclipped batches retain the
-        // existing per-bound copy at one order, or one union across orders.
-        let sprites;
-        if paths.last().unwrap().order == first_path.order {
-            sprites = paths
+        let sprites: Vec<PathSprite> = if let Some(bounds) = gpui::path_batch_copy_bounds(paths) {
+            vec![PathSprite {
+                bounds,
+                clip: first_path.clip,
+            }]
+        } else {
+            paths
                 .iter()
                 .map(|path| PathSprite {
                     bounds: path.clipped_bounds(),
                     clip: path.clip,
                 })
-                .collect();
-        } else {
-            let mut bounds = first_path.clipped_bounds();
-            for path in paths.iter().skip(1) {
-                bounds = bounds.union(&path.clipped_bounds());
-            }
-            sprites = vec![PathSprite {
-                bounds,
-                clip: RoundedClipParams::default(),
-            }];
-        }
+                .collect()
+        };
 
         let sprite_instance_bindings = writer.write(&sprites)?;
         command_encoder.set_vertex_buffer(
@@ -3042,6 +3025,95 @@ mod backdrop_blur_tests {
         for channel in 0..4 {
             assert!(
                 (clipped[channel] as f32 - baseline[channel] as f32 * 0.479_184_72).abs() <= 3.
+            );
+        }
+    }
+
+    #[test]
+    fn same_layer_complementary_paths_share_coverage_and_copy_once() {
+        let mut renderer = renderer();
+        renderer.opaque = false;
+        let viewport = bounds(0., 0., 64., 64.);
+        let rounded = RoundedClipParams {
+            left: 0.,
+            top: 0.,
+            right: 64.,
+            bottom: 64.,
+            top_left: 8.,
+            top_right: 8.,
+            bottom_right: 8.,
+            bottom_left: 8.,
+        };
+        for (color, expected_alpha) in [(0xffffffff, 255_u8), (0xffffff80, 128_u8)] {
+            let mut images = Vec::new();
+            for clip in [RoundedClipParams::default(), rounded] {
+                let mut scene = Scene::default();
+                scene.push_layer(viewport);
+                for vertices in [
+                    (
+                        point(px(0.), px(0.)),
+                        point(px(64.), px(0.)),
+                        point(px(0.), px(64.)),
+                    ),
+                    (
+                        point(px(64.), px(64.)),
+                        point(px(0.), px(64.)),
+                        point(px(64.), px(0.)),
+                    ),
+                ] {
+                    let mut path = Path::new(vertices.0);
+                    path.push_triangle(vertices, (point(0., 1.), point(0., 1.), point(0., 1.)));
+                    let mut path = path.scale(1.);
+                    path.content_mask = ContentMask { bounds: viewport };
+                    path.color = solid_background(rgba(color));
+                    path.clip = clip;
+                    scene.insert_primitive(path);
+                }
+                scene.pop_layer();
+                assert_eq!(scene.paths.len(), 2);
+                assert_eq!(scene.paths[0].order, scene.paths[1].order);
+                images.push(render(&mut renderer, &mut scene, 64, 64));
+            }
+
+            for (x, y) in [(20, 20), (43, 43), (20, 43), (31, 32), (32, 31), (43, 20)] {
+                let baseline = images[0].get_pixel(x, y);
+                let clipped = images[1].get_pixel(x, y);
+                for channel in 0..4 {
+                    assert!(
+                        baseline[channel].abs_diff(expected_alpha) <= 2,
+                        "unclipped ({x}, {y}): {baseline:?}, expected {expected_alpha}"
+                    );
+                    assert!(
+                        clipped[channel].abs_diff(baseline[channel]) <= 2,
+                        "clipped ({x}, {y}): {clipped:?}, baseline: {baseline:?}"
+                    );
+                }
+            }
+            assert_eq!(images[1].get_pixel(0, 0)[3], 0);
+            let edge = images[1].get_pixel(2, 2)[3];
+            assert!(edge > 0 && edge < expected_alpha, "rounded edge: {edge}");
+        }
+    }
+
+    #[test]
+    fn overlapping_paths_with_the_same_clip_preserve_draw_order() {
+        let mut renderer = renderer();
+        renderer.opaque = false;
+        let mut scene = Scene::default();
+        scene.insert_primitive(solid_path(0, 0xff000080, rounded_clip()));
+        scene.insert_primitive(solid_path(0, 0x00ff0080, rounded_clip()));
+        assert_eq!(scene.paths.len(), 2);
+        assert!(scene.paths[0].order < scene.paths[1].order);
+
+        let image = render(&mut renderer, &mut scene, 64, 64);
+        for (x, y, expected) in [
+            (13, 13, [47_u8, 61, 0, 108]),
+            (30, 30, [64_u8, 128, 0, 192]),
+        ] {
+            let actual = image.get_pixel(x, y).0;
+            assert!(
+                actual.iter().zip(expected).all(|(a, b)| a.abs_diff(b) <= 4),
+                "pixel ({x}, {y})={actual:?}, expected {expected:?}"
             );
         }
     }

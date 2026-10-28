@@ -1159,6 +1159,47 @@ where
     }
 }
 
+/// Split paths into a group that can share an MSAA resolve and the remaining paths.
+///
+/// Unclipped paths retain their existing ordered batch. A paint layer promises
+/// that equal-order geometry does not overlap, so clipped paths in that layer
+/// may share a resolve when their clips match.
+pub fn split_path_batch(
+    paths: &[Path<ScaledPixels>],
+) -> (&[Path<ScaledPixels>], &[Path<ScaledPixels>]) {
+    let Some(first) = paths.first() else {
+        return paths.split_at(0);
+    };
+    if first.clip.right <= first.clip.left {
+        let end = paths
+            .iter()
+            .position(|path| path.clip.right > path.clip.left)
+            .unwrap_or(paths.len());
+        return paths.split_at(end);
+    }
+
+    let end = paths[1..]
+        .iter()
+        .position(|path| path.clip != first.clip || path.order != first.order)
+        .map_or(paths.len(), |index| index + 1);
+    paths.split_at(end)
+}
+
+/// Return a single copy rectangle when path sprite bounds can overlap.
+///
+/// Otherwise each path's bounds may be copied independently.
+pub fn path_batch_copy_bounds(paths: &[Path<ScaledPixels>]) -> Option<Bounds<ScaledPixels>> {
+    let mut paths = paths.iter();
+    let mut bounds = paths.next()?.clipped_bounds();
+    let mut overlaps = false;
+    for path in paths {
+        let next_bounds = path.clipped_bounds();
+        overlaps |= bounds.intersects(&next_bounds);
+        bounds = bounds.union(&next_bounds);
+    }
+    overlaps.then_some(bounds)
+}
+
 impl From<Path<ScaledPixels>> for Primitive {
     fn from(path: Path<ScaledPixels>) -> Self {
         Primitive::Path(path)

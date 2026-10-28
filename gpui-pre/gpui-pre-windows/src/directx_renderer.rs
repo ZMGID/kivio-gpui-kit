@@ -640,19 +640,12 @@ impl DirectXRenderer {
     fn draw_paths(&mut self, paths: &[Path<ScaledPixels>]) -> Result<()> {
         let mut vertices = Vec::new();
         let mut sprites = Vec::new();
-        let mut start = 0;
-        while start < paths.len() {
-            let mut end = start + 1;
-            if paths[start].clip.right <= paths[start].clip.left {
-                while end < paths.len() && paths[end].clip.right <= paths[end].clip.left {
-                    end += 1;
-                }
-            }
-            // A clipped path needs its own resolved image so coverage is applied
-            // once, after its triangles and before the next path is composited.
-            self.draw_paths_to_intermediate(&paths[start..end], &mut vertices)?;
-            self.draw_paths_from_intermediate(&paths[start..end], &mut sprites)?;
-            start = end;
+        let mut remaining = paths;
+        while !remaining.is_empty() {
+            let (batch, rest) = gpui::split_path_batch(remaining);
+            self.draw_paths_to_intermediate(batch, &mut vertices)?;
+            self.draw_paths_from_intermediate(batch, &mut sprites)?;
+            remaining = rest;
         }
         Ok(())
     }
@@ -687,7 +680,7 @@ impl DirectXRenderer {
             );
         }
 
-        // Reuse scratch storage when clipped paths require separate draws.
+        // Reuse scratch storage across path batches.
         vertices.clear();
 
         for path in paths {
@@ -739,28 +732,18 @@ impl DirectXRenderer {
             return Ok(());
         };
 
-        // When copying paths from the intermediate texture to the drawable,
-        // each pixel must only be copied once, in case of transparent paths.
-        //
-        // If all paths have the same draw order, then their bounds are all
-        // disjoint, so we can copy each path's bounds individually. If this
-        // batch combines different draw orders, we perform a single copy
-        // for a minimal spanning rect.
+        // Copy overlapping path bounds once so translucent pixels are not blended twice.
         sprites.clear();
-        if paths.last().unwrap().order == first_path.order {
+        if let Some(bounds) = gpui::path_batch_copy_bounds(paths) {
+            sprites.push(PathSprite {
+                bounds,
+                clip: first_path.clip,
+            });
+        } else {
             sprites.extend(paths.iter().map(|path| PathSprite {
                 bounds: path.clipped_bounds(),
                 clip: path.clip,
             }));
-        } else {
-            let mut bounds = first_path.clipped_bounds();
-            for path in paths.iter().skip(1) {
-                bounds = bounds.union(&path.clipped_bounds());
-            }
-            sprites.push(PathSprite {
-                bounds,
-                clip: RoundedClipParams::default(),
-            });
         }
 
         let devices = self.devices.as_ref().context("devices missing")?;

@@ -11,6 +11,7 @@ use collections::FxHashMap;
 use gpui::{
     AtlasTextureId, BackdropBlur, Background, Bounds, DevicePixels, GpuSpecs, Path, Point,
     PrimitiveBatch, RoundedClipParams, ScaledPixels, Scene, Size, get_gamma_correction_ratios,
+    path_batch_copy_bounds, split_path_batch,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -1754,7 +1755,7 @@ impl WgpuRendererCore {
                             continue;
                         }
 
-                        // Isolate clipped paths, but keep consecutive unclipped paths batched.
+                        // Shared clips and non-overlapping paths can share an MSAA resolve.
                         let mut remaining = paths;
                         while !remaining.is_empty() {
                             let (batch, rest) = split_path_batch(remaining);
@@ -2014,24 +2015,19 @@ impl WgpuRendererCore {
         pass: &mut wgpu::RenderPass<'_>,
     ) -> Result<()> {
         let first_path = &paths[0];
-        let sprites: Vec<PathSprite> = if paths.last().map(|p| &p.order) == Some(&first_path.order)
-        {
-            paths
-                .iter()
-                .map(|p| PathSprite {
-                    bounds: p.clipped_bounds(),
-                    clip: p.clip,
-                })
-                .collect()
-        } else {
-            let mut bounds = first_path.clipped_bounds();
-            for path in paths.iter().skip(1) {
-                bounds = bounds.union(&path.clipped_bounds());
-            }
+        let sprites: Vec<PathSprite> = if let Some(bounds) = path_batch_copy_bounds(paths) {
             vec![PathSprite {
                 bounds,
-                clip: RoundedClipParams::default(),
+                clip: first_path.clip,
             }]
+        } else {
+            paths
+                .iter()
+                .map(|path| PathSprite {
+                    bounds: path.clipped_bounds(),
+                    clip: path.clip,
+                })
+                .collect()
         };
 
         let Some(path_intermediate_view) = self.resources().path_intermediate_view.clone() else {
@@ -2765,23 +2761,6 @@ impl gpui::PlatformHeadlessRenderer for WgpuHeadlessRenderer {
     fn sprite_atlas(&self) -> Arc<dyn gpui::PlatformAtlas> {
         self.core.atlas.clone()
     }
-}
-
-fn split_path_batch(
-    paths: &[Path<ScaledPixels>],
-) -> (&[Path<ScaledPixels>], &[Path<ScaledPixels>]) {
-    if paths.is_empty() {
-        return paths.split_at(0);
-    }
-    let end = if paths[0].clip.right > paths[0].clip.left {
-        1
-    } else {
-        paths
-            .iter()
-            .position(|path| path.clip.right > path.clip.left)
-            .unwrap_or(paths.len())
-    };
-    paths.split_at(end)
 }
 
 fn instance_range(range: Range<usize>) -> Range<u32> {

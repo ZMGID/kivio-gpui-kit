@@ -1012,6 +1012,180 @@ fn rectangular_path(color: Hsla, clip: RoundedClipParams, order: u32) -> Path<Sc
     path
 }
 
+fn triangle_path(
+    vertices: [(f32, f32); 3],
+    color: Hsla,
+    clip: RoundedClipParams,
+    order: u32,
+) -> Path<ScaledPixels> {
+    let position = |(x, y): (f32, f32)| gpui::point(gpui::px(x), gpui::px(y));
+    let mut path = gpui::Path::new(position(vertices[0]));
+    path.push_triangle(
+        (
+            position(vertices[0]),
+            position(vertices[1]),
+            position(vertices[2]),
+        ),
+        (
+            gpui::point(0., 1.),
+            gpui::point(0., 1.),
+            gpui::point(0., 1.),
+        ),
+    );
+    let mut path = path.scale(1.);
+    path.order = order;
+    path.color = color.into();
+    path.clip = clip;
+    path.content_mask.bounds = bounds(0., 0., 64., 64.);
+    path
+}
+
+#[test]
+fn clipped_path_batches_join_shared_edges_but_isolate_order_and_clip_changes() {
+    let clip = asymmetric_clip();
+    let first = triangle_path([(0., 0.), (64., 0.), (0., 64.)], gpui::white(), clip, 0);
+    let second = triangle_path([(64., 64.), (64., 0.), (0., 64.)], gpui::white(), clip, 0);
+    let mut paths = vec![first.clone(), second.clone()];
+    let (batch, rest) = split_path_batch(&paths);
+    assert_eq!(batch.len(), 2);
+    assert!(rest.is_empty());
+    assert_eq!(path_batch_copy_bounds(batch), Some(first.clipped_bounds()));
+
+    paths[1].order = 1;
+    assert_eq!(split_path_batch(&paths).0.len(), 1);
+    paths[1].order = 0;
+    paths[1].clip.top_left = 0.;
+    assert_eq!(split_path_batch(&paths).0.len(), 1);
+    paths[0].clip.top_left = f32::NAN;
+    assert_eq!(split_path_batch(&paths).0.len(), 1);
+
+    let distant = triangle_path([(48., 48.), (64., 48.), (48., 64.)], gpui::white(), clip, 0);
+    let near = triangle_path([(0., 0.), (16., 0.), (0., 16.)], gpui::white(), clip, 0);
+    assert_eq!(path_batch_copy_bounds(&[near, distant]), None);
+}
+
+#[test]
+fn same_clip_complementary_paths_share_msaa_and_copy_alpha_once() -> anyhow::Result<()> {
+    let clip = RoundedClipParams {
+        left: 0.,
+        top: 0.,
+        right: 64.,
+        bottom: 64.,
+        top_left: 8.,
+        top_right: 8.,
+        bottom_right: 8.,
+        bottom_left: 8.,
+    };
+    for texture_instances in [false, true] {
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        if texture_instances {
+            use_texture_instances(&mut renderer);
+        }
+        let formats = renderer
+            .context
+            .adapter
+            .get_texture_format_features(renderer.core.target_format);
+        for sample_count in [1, 4] {
+            if !formats.flags.sample_count_supported(sample_count) {
+                continue;
+            }
+            renderer.core.rendering_params.path_sample_count = sample_count;
+            renderer.core.resources.invalidate_intermediate_textures();
+            enable_transparent_target(&mut renderer);
+            for opacity in [1., 0.5] {
+                let mut white = gpui::white();
+                white.a = opacity;
+                let mut scene = Scene::default();
+                scene.push_layer(bounds(0., 0., 64., 64.));
+                for vertices in [
+                    [(0., 0.), (64., 0.), (0., 64.)],
+                    [(64., 64.), (64., 0.), (0., 64.)],
+                ] {
+                    scene.insert_primitive(triangle_path(
+                        vertices,
+                        white,
+                        RoundedClipParams::default(),
+                        0,
+                    ));
+                }
+                scene.pop_layer();
+                scene.finish();
+                assert_eq!(scene.paths[0].order, scene.paths[1].order);
+                let unmasked = render_transparent(&mut renderer, &scene)?;
+                for path in &mut scene.paths {
+                    path.clip = clip;
+                }
+                let masked = render_transparent(&mut renderer, &scene)?;
+                let expected = (255. * opacity).round() as u8;
+                for (x, y) in [(10, 10), (31, 32), (40, 40)] {
+                    for image in [&unmasked, &masked] {
+                        let pixel = image.get_pixel(x, y).0;
+                        assert!(
+                            pixel.iter().all(|channel| channel.abs_diff(expected) <= 2),
+                            "texture={texture_instances}, samples={sample_count}, opacity={opacity}, ({x},{y}): {pixel:?}"
+                        );
+                    }
+                }
+                let coverage = (0.5 - (5.5_f32.hypot(5.5) - 8.)).clamp(0., 1.);
+                let expected_edge = (f32::from(expected) * coverage).round() as u8;
+                let edge = masked.get_pixel(2, 2).0;
+                assert!(
+                    edge.iter()
+                        .all(|channel| channel.abs_diff(expected_edge) <= 3),
+                    "texture={texture_instances}, samples={sample_count}, opacity={opacity}: {edge:?}"
+                );
+                assert_eq!(masked.get_pixel(0, 0).0, [0, 0, 0, 0]);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn overlapping_clipped_paths_are_composited_separately() -> anyhow::Result<()> {
+    for texture_instances in [false, true] {
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        if texture_instances {
+            use_texture_instances(&mut renderer);
+        }
+        enable_transparent_target(&mut renderer);
+        let mut red = gpui::red();
+        red.a = 0.5;
+        let mut blue = gpui::blue();
+        blue.a = 0.5;
+        let first = rectangular_path(red, asymmetric_clip(), 0);
+        for (order, different_clip) in [(1, false), (0, true)] {
+            let mut clip = asymmetric_clip();
+            if different_clip {
+                clip.top_left = 12.;
+            }
+            let second = rectangular_path(blue, clip, order);
+            let mut scene = Scene::default();
+            scene.paths.push(first.clone());
+            let behind = render_transparent(&mut renderer, &scene)?;
+            scene.paths[0] = second.clone();
+            let front = render_transparent(&mut renderer, &scene)?;
+            scene.paths = vec![first.clone(), second];
+            scene.finish();
+            let combined = render_transparent(&mut renderer, &scene)?;
+            for (x, y) in [(11, 13), (32, 24)] {
+                let back = behind.get_pixel(x, y).0;
+                let front = front.get_pixel(x, y).0;
+                let actual = combined.get_pixel(x, y).0;
+                for channel in 0..4 {
+                    let expected = front[channel] as f32
+                        + back[channel] as f32 * (1. - front[3] as f32 / 255.);
+                    assert!(
+                        (actual[channel] as f32 - expected).abs() <= 3.,
+                        "texture={texture_instances}, order={order}, different_clip={different_clip}, ({x},{y}): {actual:?}"
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn path_batches_keep_unclipped_runs_together() {
     let mut paths: Vec<_> = (0..303)

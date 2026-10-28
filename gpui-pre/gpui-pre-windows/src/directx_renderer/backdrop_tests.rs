@@ -1635,6 +1635,166 @@ fn test_path(color: Hsla, order: u32) -> Path<ScaledPixels> {
     path
 }
 
+fn complementary_triangle_scene(first_color: Hsla, second_color: Hsla) -> Scene {
+    let mut scene = Scene::default();
+    scene.push_layer(bounds(0., 0., 64., 64.));
+    for (upper, color) in [(true, first_color), (false, second_color)] {
+        let mut path = Path::new(point(px(0.), px(0.)));
+        if upper {
+            path.line_to(point(px(64.), px(0.)));
+            path.line_to(point(px(64.), px(64.)));
+        } else {
+            path.line_to(point(px(64.), px(64.)));
+            path.line_to(point(px(0.), px(64.)));
+        }
+        let mut path = path.scale(1.);
+        path.color = color.into();
+        path.content_mask.bounds = bounds(0., 0., 64., 64.);
+        scene.insert_primitive(path);
+    }
+    scene.pop_layer();
+    scene.finish();
+    assert_eq!(scene.paths.len(), 2);
+    assert_eq!(scene.paths[0].order, scene.paths[1].order);
+    scene
+}
+
+fn triangle_clip() -> RoundedClipParams {
+    RoundedClipParams {
+        left: 0.,
+        top: 0.,
+        right: 64.,
+        bottom: 64.,
+        top_left: 8.,
+        top_right: 8.,
+        bottom_right: 8.,
+        bottom_left: 8.,
+    }
+}
+
+#[::core::prelude::v1::test]
+fn warp_same_layer_clipped_triangles_resolve_the_shared_edge_once() -> Result<()> {
+    let (mut renderer, _window) = warp_renderer()?;
+    let white = hsla(0., 0., 1., 1.);
+    let mut scene = complementary_triangle_scene(white, white);
+    let clipped = assert_rounded_clip(
+        &mut renderer,
+        &mut scene,
+        WindowBackgroundAppearance::Transparent,
+        triangle_clip(),
+        |scene, clip| {
+            for path in &mut scene.paths {
+                path.clip = clip;
+            }
+        },
+    )?;
+    assert_eq!(gpui::split_path_batch(&scene.paths).0.len(), 2);
+    for diagonal in 8..56 {
+        let pixel = clipped[diagonal * 64 + diagonal];
+        assert!(
+            pixel[3] >= 253,
+            "shared diagonal ({diagonal},{diagonal}) has a seam: {pixel:?}"
+        );
+    }
+    assert_eq!(clipped[0][3], 0);
+    assert!((1..255).contains(&clipped[2 * 64 + 2][3]));
+    Ok(())
+}
+
+#[::core::prelude::v1::test]
+fn warp_same_layer_unclipped_triangles_copy_overlapping_bounds_once() -> Result<()> {
+    let (mut renderer, _window) = warp_renderer()?;
+    let white = hsla(0., 0., 1., 0.5);
+    let scene = complementary_triangle_scene(white, white);
+    renderer.render(&scene, WindowBackgroundAppearance::Transparent)?;
+    let actual = pixels(&renderer)?;
+    for y in 8..56 {
+        for x in 8..56 {
+            let pixel = actual[y * 64 + x];
+            assert!(
+                pixel.iter().all(|channel| channel.abs_diff(128) <= 2),
+                "half-alpha triangle pixel ({x},{y}) was copied more than once: {pixel:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[::core::prelude::v1::test]
+fn warp_same_layer_triangles_keep_different_rounded_clips_isolated() -> Result<()> {
+    let (mut renderer, _window) = warp_renderer()?;
+    let red = hsla(0., 1., 0.5, 0.5);
+    let blue = hsla(2. / 3., 1., 0.5, 0.5);
+    let mut scene = complementary_triangle_scene(red, blue);
+    scene.paths[0].clip = RoundedClipParams {
+        left: 32.,
+        ..triangle_clip()
+    };
+    scene.paths[1].clip = RoundedClipParams {
+        right: 32.,
+        ..triangle_clip()
+    };
+    assert_eq!(gpui::split_path_batch(&scene.paths).0.len(), 1);
+    renderer.render(&scene, WindowBackgroundAppearance::Transparent)?;
+    let actual = pixels(&renderer)?;
+    for (x, y, expected) in [
+        (48, 16, [0_u8, 0, 128, 128]),
+        (16, 48, [128, 0, 0, 128]),
+        (16, 8, [0, 0, 0, 0]),
+        (48, 56, [0, 0, 0, 0]),
+    ] {
+        let pixel = actual[y * 64 + x];
+        assert!(
+            pixel.iter().zip(expected).all(|(a, b)| a.abs_diff(b) <= 2),
+            "different clips at ({x},{y}): {pixel:?}, expected {expected:?}"
+        );
+    }
+    Ok(())
+}
+
+#[::core::prelude::v1::test]
+fn warp_different_order_paths_composite_after_their_shared_clip() -> Result<()> {
+    let (mut renderer, _window) = warp_renderer()?;
+    let mut first = test_path(hsla(0., 1., 0.5, 0.5), 0);
+    let mut last = test_path(hsla(2. / 3., 1., 0.5, 0.5), 1);
+    first.clip = triangle_clip();
+    last.clip = first.clip;
+    let mut scene = Scene::default();
+    scene.paths.push(first.clone());
+    renderer.render(&scene, WindowBackgroundAppearance::Transparent)?;
+    let behind = pixels(&renderer)?;
+    scene.paths[0] = last.clone();
+    renderer.render(&scene, WindowBackgroundAppearance::Transparent)?;
+    let front = pixels(&renderer)?;
+    let edge = 3 * 64 + 1;
+    assert!((60..90).contains(&front[edge][3]));
+
+    scene.paths = vec![first, last];
+    scene.finish();
+    assert_eq!(gpui::split_path_batch(&scene.paths).0.len(), 1);
+    renderer.render(&scene, WindowBackgroundAppearance::Transparent)?;
+    let combined = pixels(&renderer)?;
+    assert!((120..140).contains(&combined[edge][3]));
+    for y in 0..64 {
+        for x in 0..64 {
+            let index = y * 64 + x;
+            let remaining = 1. - front[index][3] as f32 / 255.;
+            for channel in 0..4 {
+                let expected =
+                    front[index][channel] as f32 + behind[index][channel] as f32 * remaining;
+                assert!(
+                    (combined[index][channel] as f32 - expected).abs() <= 4.,
+                    "different orders at ({x},{y}) channel {channel}: {:?} over {:?} yielded {:?}",
+                    front[index],
+                    behind[index],
+                    combined[index]
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 #[::core::prelude::v1::test]
 fn warp_rounded_clip_applies_to_shadows_underlines_and_paths() -> Result<()> {
     let (mut renderer, _window) = warp_renderer()?;

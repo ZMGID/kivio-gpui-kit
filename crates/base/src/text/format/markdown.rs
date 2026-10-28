@@ -858,6 +858,17 @@ fn parse_paragraph(
                 ..Default::default()
             });
         }
+        Node::ImageReference(raw) => {
+            if let Some(reference) = cx.link_refs.get(raw.identifier.as_str()) {
+                paragraph.push_image(ImageNode {
+                    url: reference.url.clone().into(),
+                    title: reference.title.clone(),
+                    alt: Some(raw.alt.clone().into()),
+                    span,
+                    ..Default::default()
+                });
+            }
+        }
         Node::Break(_) => {
             // Hard line break (trailing two spaces / backslash). Mirror the
             // inline-HTML <br> path: emit a newline inline node so the break
@@ -921,11 +932,15 @@ fn parse_paragraph(
             )]));
         }
         Node::LinkReference(link) => {
-            let link_mark = LinkMark {
-                url: "".into(),
-                title: link.label.clone().map(Into::into),
-                identifier: Some(link.identifier.clone().into()),
-            };
+            let link_mark = cx
+                .link_refs
+                .get(link.identifier.as_str())
+                .cloned()
+                .unwrap_or_else(|| LinkMark {
+                    url: "".into(),
+                    title: link.label.clone().map(Into::into),
+                    identifier: Some(link.identifier.clone().into()),
+                });
 
             text = merge_children_with_mark(
                 source,
@@ -948,11 +963,34 @@ fn parse_paragraph(
     text
 }
 
+fn collect_definitions(node: &Node, cx: &mut NodeContext) {
+    if let Node::Definition(def) = node {
+        if !cx.link_refs.contains_key(def.identifier.as_str()) {
+            cx.add_ref(
+                def.identifier.clone().into(),
+                LinkMark {
+                    url: def.url.clone().into(),
+                    identifier: Some(def.identifier.clone().into()),
+                    title: def.title.clone().map(Into::into),
+                },
+            );
+        }
+    }
+    if let Some(children) = node.children() {
+        for child in children {
+            collect_definitions(child, cx);
+        }
+    }
+}
+
 fn ast_to_document(source: &str, root: mdast::Node, cx: &mut NodeContext) -> ParsedDocument {
     let root = match root {
         Node::Root(r) => r,
         _ => panic!("expected root node"),
     };
+    for node in &root.children {
+        collect_definitions(node, cx);
+    }
 
     let blocks = root
         .children
@@ -1138,23 +1176,12 @@ fn ast_to_node(source: &str, value: mdast::Node, cx: &mut NodeContext) -> BlockN
             paragraph.span = new_span(def.position, cx);
             BlockNode::Paragraph(paragraph)
         }
-        Node::Definition(def) => {
-            cx.add_ref(
-                def.identifier.clone().into(),
-                LinkMark {
-                    url: def.url.clone().into(),
-                    identifier: Some(def.identifier.clone().into()),
-                    title: def.title.clone().map(Into::into),
-                },
-            );
-
-            BlockNode::Definition {
-                identifier: def.identifier.clone().into(),
-                url: def.url.clone().into(),
-                title: def.title.clone().map(|s| s.into()),
-                span: new_span(def.position, cx),
-            }
-        }
+        Node::Definition(def) => BlockNode::Definition {
+            identifier: def.identifier.clone().into(),
+            url: def.url.clone().into(),
+            title: def.title.clone().map(|s| s.into()),
+            span: new_span(def.position, cx),
+        },
         _ => {
             if cfg!(debug_assertions) {
                 tracing::warn!("unsupported node: {:#?}", value);
@@ -1986,6 +2013,91 @@ mod tests {
                 .iter()
                 .any(|(_, mark)| mark.bold && mark.italic),
             "nested emphasis should produce a bold and italic mark"
+        );
+    }
+
+    #[test]
+    fn reference_links_and_images_use_the_first_definition_in_either_order() {
+        for source in [
+            "[Guide][ key ] [![Logo][pIc]][key]\n\n[key]: /first \"Link\"\n[pic]: /one.png \"Image\"\n[KEY]: /wrong\n[PIC]: /wrong.png",
+            "[key]: /first \"Link\"\n[pic]: /one.png \"Image\"\n\n[Guide][ key ] [![Logo][pIc]][key]\n\n[KEY]: /wrong\n[PIC]: /wrong.png",
+        ] {
+            let mut cx = NodeContext::default();
+            let document = parse(source, &mut cx).unwrap();
+            let paragraph = document.blocks.iter().find_map(first_paragraph).unwrap();
+            let link = paragraph
+                .children
+                .iter()
+                .flat_map(|child| &child.marks)
+                .find_map(|(_, mark)| mark.link.as_ref())
+                .expect("reference link");
+            assert_eq!(link.url.as_ref(), "/first");
+            assert_eq!(link.title.as_deref(), Some("Link"));
+            let image = paragraph
+                .children
+                .iter()
+                .find_map(|child| child.image.as_ref())
+                .expect("reference image");
+            assert_eq!(image.url.as_ref(), "/one.png");
+            assert_eq!(image.alt.as_deref(), Some("Logo"));
+            assert_eq!(image.title.as_deref(), Some("Image"));
+            assert_eq!(
+                image.link.as_ref().map(|link| link.url.as_ref()),
+                Some("/first")
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn reference_link_click_and_image_source_reach_the_real_text_view(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::{Context, IntoElement, Modifiers, Render, Styled, Window, div, point, px};
+        use std::sync::{Arc, Mutex};
+
+        struct Root {
+            clicks: Arc<Mutex<Vec<String>>>,
+            images: Arc<Mutex<Vec<String>>>,
+        }
+
+        impl Render for Root {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let clicks = self.clicks.clone();
+                let images = self.images.clone();
+                div().w(px(400.)).child(
+                    crate::TextView::markdown(
+                        "reference-test",
+                        "[Guide][target] ![Logo][img]\n\n[target]: https://example.invalid/link\n[img]: https://example.invalid/image.png",
+                    )
+                    .on_link_click(move |url, _, _, _| {
+                        clicks.lock().unwrap().push(url.to_string());
+                    })
+                    .image_source(move |url| {
+                        images.lock().unwrap().push(url.to_string());
+                        gpui::ImageSource::Custom(Arc::new(|_, _| None))
+                    }),
+                )
+            }
+        }
+
+        cx.update(crate::init);
+        let clicks = Arc::new(Mutex::new(Vec::new()));
+        let images = Arc::new(Mutex::new(Vec::new()));
+        let expected_clicks = clicks.clone();
+        let expected_images = images.clone();
+        let (_, cx) = cx.add_window_view(move |_, _| Root { clicks, images });
+        let cx: &mut gpui::VisualTestContext = cx;
+        cx.simulate_click(point(px(10.), px(10.)), Modifiers::default());
+        assert_eq!(
+            &*expected_clicks.lock().unwrap(),
+            &["https://example.invalid/link"]
+        );
+        assert!(
+            expected_images
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|url| url == "https://example.invalid/image.png")
         );
     }
 

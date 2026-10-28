@@ -34,6 +34,7 @@ Maintain each conceptual patch as a separate commit with regression coverage. Wh
 | Image alpha masks | `gpui-pre`, three native renderers | zui scene/window/shaders; Zeron `crates/ui/src/new_thread_background_mask.rs` | `0ce0a5e` |
 | Shared-edge path coverage and once-only resolve copies | `gpui-pre`, three native renderers | Existing `Window::paint_layer` geometry contract and real-pixel regressions | `fix(render): preserve shared-edge coverage and path opacity` |
 | Media borders outside descendant clips | `gpui-component`, Kit rendering tests | Native `rounded_clip`, existing `Div` paint and layout contracts | `fix(component): preserve rounded media borders` |
+| Resolved Markdown reference links and images | `gpui-base` | Existing mdast definitions and `TextView` click/image hooks | `fix(text): resolve reference links and images before rendering` |
 
 The sidebar patch starts from fork commit `e485b337f2ecb778cf3a5265488baf4dfaac663d`. It uses the existing `gpui-pre` 0.3.10 focus and click behavior, not code copied from Zeron. In the Kivio P1 Windows repro, Tab from the last gallery button skipped all sidebar destinations and wrapped to the first gallery button. The component regression tests exercise Tab, Enter and Space, disabled rows, retained focus, mouse clicks and submenu/caret behavior with `--features test-support`.
 
@@ -83,5 +84,11 @@ Windows verification: core 501 passed (2 existing ignores), DirectX WARP 48 pass
 Review follow-up verification on Windows: DirectX WARP 52 passed, WGPU 75 passed, GPUI core 501 passed with 2 existing ignores. Pixel regressions cover the complementary-triangle seam, half-alpha paths with overlapping bounds, existing clip isolation, and both WGPU instance transports. These local results do not claim Metal or browser WebGL execution.
 
 Media-border review verification: component 738 unit and 50 integration tests passed on Windows. Scene regressions compare ordinary `Div` and media paint, asymmetric radii/borders, opacity, descendant clipping, and failed-image retry interaction at fractional or doubled scale. New real-pixel attachment cases live in `crates/kit/tests/rendering.rs`; that harness runs on Metal/Linux WGPU, not Windows.
+
+### Markdown reference resolution
+
+AST conversion collects definitions in document order before converting blocks, keeps the first definition for a normalized label, and resolves link marks and reference images while that context is available. A `TextView` no longer depends on discarded parser context to recover a link's URL at paint time. No new public context API or renderer state is added.
+
+Windows verification: base 1492 unit tests and 2 integration tests passed, including an actual TextView reference-link click and image-source callback. Base/component/Kit totals were 2707 passing tests including doc-tests; strict workspace Clippy passed with the CI exclusions. The existing unclaimed-dollar-math reparse still lacks external-reference context; this patch does not change that fallback.
 
 Licensed under Apache-2.0, same as upstream (see `LICENSE-APACHE`).

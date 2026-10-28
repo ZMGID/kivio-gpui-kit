@@ -48,4 +48,6 @@ Vendored packages: `gpui-pre`, `gpui-pre-platform`, `gpui-pre-windows`, `gpui-pr
 
 Test prerequisites (`e658617`) restore the published core tests without the unpublished `util_macros::perf` dependency, use the existing IBM Plex Sans fixture, and restore `assets/fonts/lilex/Lilex-Regular.ttf` from the pinned zui reference above. Lilex is test-only and retains its accompanying SIL Open Font License in `assets/fonts/lilex/OFL.txt`; it is not part of the application's font bundle.
 
+The WGPU font-family regression uses the existing full and subset IBM Plex Sans faces plus Lilex Regular; it does not require an unavailable Lilex Bold file. Its standalone Windows run passed 45 tests (font, atlas, shader and layout checks); Linux-only WGPU pixel tests are not included in that result.
+
 Licensed under Apache-2.0, same as upstream (see `LICENSE-APACHE`).

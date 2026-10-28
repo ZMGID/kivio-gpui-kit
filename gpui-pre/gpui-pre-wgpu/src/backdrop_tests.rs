@@ -1012,6 +1012,107 @@ fn rectangular_path(color: Hsla, clip: RoundedClipParams, order: u32) -> Path<Sc
 }
 
 #[test]
+fn path_batches_keep_unclipped_runs_together() {
+    let mut paths: Vec<_> = (0..303)
+        .map(|order| rectangular_path(gpui::white(), RoundedClipParams::default(), order))
+        .collect();
+    for index in [100, 201, 202] {
+        paths[index].clip = asymmetric_clip();
+    }
+    let mut remaining = paths.as_slice();
+    for expected in [100, 1, 100, 1, 1, 100] {
+        let (batch, rest) = split_path_batch(remaining);
+        assert_eq!(batch.len(), expected);
+        if expected == 1 {
+            assert!(batch[0].clip.right > batch[0].clip.left);
+        } else {
+            assert!(batch.iter().all(|path| path.clip.right <= path.clip.left));
+        }
+        remaining = rest;
+    }
+    assert!(remaining.is_empty());
+    let (empty, rest) = split_path_batch(remaining);
+    assert!(empty.is_empty() && rest.is_empty());
+}
+
+#[test]
+fn mixed_path_batches_preserve_alpha_and_order() -> anyhow::Result<()> {
+    for texture_instances in [false, true] {
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        if texture_instances {
+            use_texture_instances(&mut renderer);
+        }
+        enable_transparent_target(&mut renderer);
+        let mut red = gpui::red();
+        red.a = 0.5;
+        let mut blue = gpui::blue();
+        blue.a = 0.5;
+        let green = gpui::hsla(1. / 3., 1., 0.5, 0.5);
+        let mut scene = Scene::default();
+        scene.paths.push(rectangular_path(red, RoundedClipParams::default(), 0));
+        scene.paths.push(rectangular_path(blue, RoundedClipParams::default(), 1));
+        scene.paths.push(rectangular_path(green, asymmetric_clip(), 2));
+        scene.paths.push(rectangular_path(red, RoundedClipParams::default(), 3));
+        scene.paths.push(rectangular_path(blue, RoundedClipParams::default(), 4));
+        scene.finish();
+        let image = render_transparent(&mut renderer, &scene)?;
+        for (x, y, expected) in [
+            (8, 8, [80_u8, 0, 159, 239]),
+            (32, 24, [72_u8, 32, 143, 247]),
+        ] {
+            let actual = image.get_pixel(x, y).0;
+            assert!(
+                actual.iter().zip(expected).all(|(a, b)| a.abs_diff(b) <= 4),
+                "pixel ({x}, {y})={actual:?}, expected {expected:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn fractional_rounded_path_edge_is_clipped_after_msaa_resolve() -> anyhow::Result<()> {
+    for texture_instances in [false, true] {
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        if texture_instances {
+            use_texture_instances(&mut renderer);
+        }
+        let formats = renderer.context.adapter.get_texture_format_features(renderer.core.target_format);
+        for sample_count in [1, 4] {
+            if !formats.flags.sample_count_supported(sample_count) {
+                continue;
+            }
+            renderer.core.rendering_params.path_sample_count = sample_count;
+            renderer.core.resources.invalidate_intermediate_textures();
+            enable_transparent_target(&mut renderer);
+            let mut red = gpui::red();
+            red.a = 0.5;
+            let clip = RoundedClipParams {
+                left: 8.75, top: 8.75, right: 55.25, bottom: 55.25,
+                top_left: 8.0, top_right: 8.0, bottom_right: 8.0, bottom_left: 8.0,
+            };
+            let mut path = rectangular_path(red, clip, 0);
+            // A rounded scope supplies the outward-covered rectangular content mask.
+            path.content_mask.bounds = bounds(8.0, 8.0, 48.0, 48.0);
+            path.vertices.extend(path.vertices.clone());
+            let mut scene = Scene::default();
+            scene.paths.push(path);
+            scene.finish();
+            let image = render_transparent(&mut renderer, &scene)?;
+            for (x, y, expected) in [(8, 32, 48_u8), (32, 8, 48), (9, 32, 191)] {
+                let pixel = image.get_pixel(x, y).0;
+                assert!(
+                    pixel[3].abs_diff(expected) <= 3 && pixel[0].abs_diff(pixel[3]) <= 2,
+                    "samples={sample_count}, pixel ({x}, {y})={pixel:?}, expected alpha {expected}"
+                );
+            }
+            assert_eq!(image.get_pixel(7, 32).0, [0, 0, 0, 0]);
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn rounded_paths_clip_resolved_overdraw_once_and_preserve_order() -> anyhow::Result<()> {
     for texture_instances in [false, true] {
         let mut renderer = WgpuHeadlessRenderer::new()?;

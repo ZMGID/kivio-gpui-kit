@@ -1704,6 +1704,60 @@ fn warp_rounded_clip_applies_to_shadows_underlines_and_paths() -> Result<()> {
 }
 
 #[::core::prelude::v1::test]
+fn warp_fractional_rounded_path_clip_keeps_conservative_mask_coverage() -> Result<()> {
+    let (mut renderer, _window) = warp_renderer()?;
+    // Window::with_rounded_clip snaps the rectangular content mask outwards,
+    // but leaves the rounded scope at its original device-pixel coordinates.
+    let clip = RoundedClipParams {
+        left: 8.75,
+        top: 6.75,
+        right: 38.75,
+        bottom: 36.75,
+        top_left: 8.,
+        top_right: 8.,
+        bottom_right: 8.,
+        bottom_left: 8.,
+    };
+    assert_eq!(rounded_clip_coverage(clip, 8, 16), 0.25);
+    assert_eq!(rounded_clip_coverage(clip, 24, 6), 0.25);
+    let corner = rounded_clip_coverage(clip, 10, 9);
+    assert!(corner > 0.1 && corner < 0.9);
+
+    for duplicate_triangles in [false, true] {
+        let mut path = test_path(hsla(0., 0., 1., 0.6), 0);
+        path.content_mask.bounds = bounds(8., 6., 31., 31.);
+        if duplicate_triangles {
+            path.vertices.extend_from_within(..);
+        }
+        let mut scene = Scene::default();
+        scene.paths.push(path);
+        renderer.render(&scene, WindowBackgroundAppearance::Transparent)?;
+        let reference = pixels(&renderer)?;
+        scene.paths[0].clip = clip;
+        renderer.render(&scene, WindowBackgroundAppearance::Transparent)?;
+        let actual = pixels(&renderer)?;
+        for (x, y) in [(8, 16), (24, 6), (10, 9), (8, 8), (38, 20), (24, 36), (24, 20)] {
+            let index = y * 64 + x;
+            let coverage = rounded_clip_coverage(clip, x, y);
+            assert!(
+                reference[index][3] > 150,
+                "conservative mask must retain the whole MSAA pixel at ({x},{y})"
+            );
+            for channel in 0..4 {
+                let expected = reference[index][channel] as f32 * coverage;
+                assert!(
+                    (actual[index][channel] as f32 - expected).abs() <= 2.,
+                    "duplicate={duplicate_triangles}, ({x},{y}), coverage {coverage}: {:?} vs {:?}",
+                    actual[index],
+                    reference[index]
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[::core::prelude::v1::test]
 fn warp_rounded_clips_apply_before_overlapping_paths_are_composited() -> Result<()> {
     let (mut renderer, _window) = warp_renderer()?;
     let mut first = test_path(hsla(2. / 3., 1., 0.5, 0.65), 0);

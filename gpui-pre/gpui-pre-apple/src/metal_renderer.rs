@@ -843,11 +843,19 @@ impl MetalRenderer {
                     self.draw_quads(range, instance_bindings, viewport_size, command_encoder)
                 }
                 PrimitiveBatch::Paths(range) => {
-                    let paths = &scene.paths[range];
-                    let clipped = paths.iter().any(|path| path.clip.right > path.clip.left);
-                    // Disjoint paths at the same order can share a raster pass; different
-                    // orders need separate composites so each rounded clip applies once.
-                    for group in paths.chunk_by(|a, b| !clipped || a.order == b.order) {
+                    let mut paths = &scene.paths[range];
+                    while let Some(first) = paths.first() {
+                        // A clipped path must not sample another path's rasterized pixels.
+                        // Preserve the existing fast batch for consecutive unclipped paths.
+                        let count = if first.clip.right > first.clip.left {
+                            1
+                        } else {
+                            paths
+                                .iter()
+                                .position(|path| path.clip.right > path.clip.left)
+                                .unwrap_or(paths.len())
+                        };
+                        let (group, remaining) = paths.split_at(count);
                         command_encoder.end_encoding();
 
                         let did_draw = self.draw_paths_to_intermediate(
@@ -875,6 +883,7 @@ impl MetalRenderer {
                                 return Err(error);
                             }
                         }
+                        paths = remaining;
                     }
                 }
                 PrimitiveBatch::Underlines(range) => {
@@ -1305,13 +1314,8 @@ impl MetalRenderer {
             Some(intermediate_texture),
         );
 
-        // When copying paths from the intermediate texture to the drawable,
-        // each pixel must only be copied once, in case of transparent paths.
-        //
-        // If all paths have the same draw order, then their bounds are all
-        // disjoint, so we can copy each path's bounds individually. If this
-        // batch combines different draw orders, we perform a single copy
-        // for a minimal spanning rect.
+        // Clipped paths arrive individually. Unclipped batches retain the
+        // existing per-bound copy at one order, or one union across orders.
         let sprites;
         if paths.last().unwrap().order == first_path.order {
             sprites = paths
@@ -3002,6 +3006,112 @@ mod backdrop_blur_tests {
                 (clipped[channel] as f32 - baseline[channel] as f32 * 0.479_184_72).abs() <= 3.
             );
         }
+    }
+
+    #[test]
+    fn same_layer_paths_do_not_sample_each_others_clips() {
+        let mut renderer = renderer();
+        renderer.opaque = false;
+        let viewport = bounds(0., 0., 64., 64.);
+        let mut square_clip = rounded_clip();
+        square_clip.top_left = 0.;
+        square_clip.bottom_right = 0.;
+        let mut scene = Scene::default();
+        scene.push_layer(viewport);
+        for (vertices, color, clip) in [
+            (
+                (
+                    point(px(0.), px(0.)),
+                    point(px(64.), px(0.)),
+                    point(px(0.), px(64.)),
+                ),
+                0xff000080,
+                rounded_clip(),
+            ),
+            (
+                (
+                    point(px(64.), px(64.)),
+                    point(px(64.), px(0.)),
+                    point(px(0.), px(64.)),
+                ),
+                0x00ff0080,
+                square_clip,
+            ),
+        ] {
+            let mut path = Path::new(vertices.0);
+            path.push_triangle(vertices, (point(0., 1.), point(0., 1.), point(0., 1.)));
+            let mut path = path.scale(1.);
+            path.content_mask = ContentMask { bounds: viewport };
+            path.color = solid_background(rgba(color));
+            path.clip = clip;
+            scene.insert_primitive(path);
+        }
+        scene.pop_layer();
+        assert_eq!(scene.paths.len(), 2);
+        assert_eq!(scene.paths[0].order, scene.paths[1].order);
+
+        let image = render(&mut renderer, &mut scene, 64, 64);
+        assert_eq!(*image.get_pixel(10, 10), image::Rgba([0, 0, 0, 0]));
+        let arc = image.get_pixel(13, 13);
+        assert!((59..=64).contains(&arc[0]) && arc[1] == 0 && (59..=64).contains(&arc[3]));
+        let red = image.get_pixel(30, 10);
+        assert!(
+            (126..=130).contains(&red[0]) && red[1] == 0 && (126..=130).contains(&red[3])
+        );
+        for (x, y) in [(40, 40), (49, 49)] {
+            let green = image.get_pixel(x, y);
+            assert!(
+                green[0] == 0
+                    && (126..=130).contains(&green[1])
+                    && (126..=130).contains(&green[3])
+            );
+        }
+    }
+
+    #[test]
+    fn fractional_rounded_path_clip_covers_msaa_edge_once() {
+        let mut renderer = renderer();
+        renderer.opaque = false;
+        let clip = RoundedClipParams {
+            left: 8.75,
+            top: 8.,
+            right: 40.25,
+            bottom: 40.,
+            top_left: 6.,
+            top_right: 6.,
+            bottom_right: 6.,
+            bottom_left: 6.,
+        };
+        let mut images = Vec::new();
+        for clipped in [false, true] {
+            let mut path = solid_path(
+                0,
+                0xffffff80,
+                if clipped { clip } else { Default::default() },
+            );
+            let second_triangle = path.vertices.clone();
+            path.vertices.extend(second_triangle);
+            // The CPU path mask covers the fractional clip outward.
+            path.content_mask = ContentMask {
+                bounds: bounds(8., 8., 33., 32.),
+            };
+            let mut scene = Scene::default();
+            scene.paths.push(path);
+            images.push(render(&mut renderer, &mut scene, 64, 64));
+        }
+        assert_eq!(images[1].get_pixel(7, 20)[3], 0);
+        assert!((188..=194).contains(&images[0].get_pixel(8, 20)[3]));
+        for x in [8, 40] {
+            for channel in 0..4 {
+                let baseline = images[0].get_pixel(x, 20)[channel] as f32;
+                let clipped = images[1].get_pixel(x, 20)[channel] as f32;
+                assert!(
+                    (clipped - baseline * 0.25).abs() <= 3.,
+                    "x={x} channel={channel}"
+                );
+            }
+        }
+        assert_eq!(images[1].get_pixel(9, 20), images[0].get_pixel(9, 20));
     }
 
     #[test]

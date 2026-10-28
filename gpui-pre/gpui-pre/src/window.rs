@@ -5133,6 +5133,9 @@ impl Window {
         let color: Background = color.into();
         path.color = color.opacity(opacity);
         let mut path = path.scale(scale_factor);
+        if self.rounded_clip.is_some() {
+            path.content_mask = self.snapped_content_mask();
+        }
         path.clip = self.scaled_rounded_clip();
         self.next_frame.scene.insert_primitive(path);
     }
@@ -9920,6 +9923,49 @@ mod tests {
             assert_eq!(sprites[0].opacity, 0.5);
             assert_eq!(window.edge_fade, None);
             assert_eq!(window.element_opacity(), 1.);
+        });
+    }
+
+    #[gpui::test]
+    fn rounded_clip_path_uses_conservative_device_mask_at_fractional_edges(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::Path;
+        test_underline_paint_at_scales(cx, |window| {
+            let scale = window.scale_factor();
+            let clip = Bounds::new(
+                point(px(8.75 / scale), px(6.75 / scale)),
+                size(px(30. / scale), px(30. / scale)),
+            );
+            let parent = ContentMask {
+                bounds: Bounds::new(
+                    point(px(10.25 / scale), px(8.5 / scale)),
+                    size(px(20. / scale), px(20. / scale)),
+                ),
+            };
+            let origin = point(px(0.), px(0.));
+            let mut path = Path::new(origin);
+            path.push_triangle(
+                (origin, point(px(100.), px(0.)), point(px(0.), px(100.))),
+                (point(0., 1.), point(0., 1.), point(0., 1.)),
+            );
+            let mut expected = Vec::new();
+            window.next_frame.scene.clear();
+            window.with_rounded_clip(clip, px(0.), |window| {
+                expected.push(window.snapped_content_mask());
+                window.paint_path(path.clone(), crate::white());
+                window.with_content_mask(Some(parent), |window| {
+                    expected.push(window.snapped_content_mask());
+                    window.paint_path(path, crate::white());
+                });
+            });
+            let paths = &window.next_frame.scene.paths;
+            assert_eq!(paths.len(), 2);
+            assert_eq!(paths[0].content_mask, expected[0]);
+            assert_eq!(paths[0].content_mask.bounds.left().0, 8.);
+            assert!((paths[0].clip.left - 8.75).abs() < 0.001);
+            assert_eq!(paths[1].content_mask, expected[1]);
+            assert_eq!(paths[1].content_mask.bounds.left().0, 10.);
         });
     }
 

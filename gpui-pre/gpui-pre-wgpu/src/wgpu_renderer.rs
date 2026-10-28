@@ -1754,15 +1754,11 @@ impl WgpuRendererCore {
                             continue;
                         }
 
-                        // Resolve overlapping triangles before clipping each path once.
-                        let split = paths.iter().any(|path| path.clip.right > path.clip.left);
-                        let batch_count = if split { paths.len() } else { 1 };
-                        for index in 0..batch_count {
-                            let batch = if split {
-                                &paths[index..index + 1]
-                            } else {
-                                paths
-                            };
+                        // Isolate clipped paths, but keep consecutive unclipped paths batched.
+                        let mut remaining = paths;
+                        while !remaining.is_empty() {
+                            let (batch, rest) = split_path_batch(remaining);
+                            remaining = rest;
                             drop(pass);
                             let rasterized = self.draw_paths_to_intermediate(
                                 &mut encoder,
@@ -2769,6 +2765,20 @@ impl gpui::PlatformHeadlessRenderer for WgpuHeadlessRenderer {
     fn sprite_atlas(&self) -> Arc<dyn gpui::PlatformAtlas> {
         self.core.atlas.clone()
     }
+}
+
+fn split_path_batch(paths: &[Path<ScaledPixels>]) -> (&[Path<ScaledPixels>], &[Path<ScaledPixels>]) {
+    if paths.is_empty() {
+        return paths.split_at(0);
+    }
+    let end = if paths[0].clip.right > paths[0].clip.left {
+        1
+    } else {
+        paths.iter()
+            .position(|path| path.clip.right > path.clip.left)
+            .unwrap_or(paths.len())
+    };
+    paths.split_at(end)
 }
 
 fn instance_range(range: Range<usize>) -> Range<u32> {

@@ -3,11 +3,13 @@ use std::{rc::Rc, time::Duration};
 use gpui::{
     AbsoluteLength, AnyElement, App, Axis, Bounds, ClickEvent, ElementId, Hsla, ImageSource,
     InteractiveElement as _, IntoElement, MouseButton, ObjectFit, ParentElement, Path, PathBuilder,
-    Pixels, Refineable as _, RenderOnce, ScrollHandle, SharedString,
+    Pixels, RenderOnce, ScrollHandle, SharedString,
     StatefulInteractiveElement as _, StyleRefinement, Styled, StyledImage as _, Window, black,
     canvas, div, img, linear_color_stop, linear_gradient, point, prelude::FluentBuilder as _, px,
     relative, rems, white,
 };
+#[cfg(feature = "gpui-fast")]
+use gpui::Refineable as _;
 use gpui_base::{
     is_mobile,
     motion::{Transition, transition},

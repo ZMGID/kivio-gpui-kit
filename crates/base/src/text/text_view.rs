@@ -4152,7 +4152,7 @@ mod tests {
             focus.dispatch_action(&crate::input::Copy, window, cx);
             assert_eq!(
                 cx.read_from_clipboard().and_then(|item| item.text()),
-                Some(expected.trim().to_string())
+                Some(expected.to_string())
             );
             assert!(focus.is_focused(window));
             assert_eq!(TextSelection::selected_text(window, cx), expected);

@@ -13,6 +13,7 @@ use gpui_kit::{
 
 struct CopyFixture {
     plain: bool,
+    text: &'static str,
     focus: FocusHandle,
 }
 
@@ -20,9 +21,9 @@ impl Render for CopyFixture {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         let focus = self.focus.clone();
         let text = if self.plain {
-            SelectableText::new("plain-copy", "  alpha  \nbeta  ").into_any_element()
+            SelectableText::new("plain-copy", self.text).into_any_element()
         } else {
-            TextView::markdown("markdown-copy", "alpha\n\nbeta").into_any_element()
+            TextView::markdown("markdown-copy", self.text).into_any_element()
         };
         div().p_4().child(
             div()
@@ -43,11 +44,16 @@ impl Render for CopyFixture {
 #[gpui_kit::test]
 fn copy_keeps_selected_boundary_whitespace_in_root_and_text_view(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
-    for plain in [true, false] {
+    for (plain, text) in [
+        (true, "  alpha  \nbeta  "),
+        (true, "  \n  "),
+        (false, "alpha\n\nbeta"),
+    ] {
         let (window, _) = cx.update(|cx| {
             gpui_kit::open_window(Default::default(), cx, |_, cx| {
                 cx.new(|cx| CopyFixture {
                     plain,
+                    text,
                     focus: cx.focus_handle(),
                 })
             })
@@ -63,7 +69,7 @@ fn copy_keeps_selected_boundary_whitespace_in_root_and_text_view(cx: &mut TestAp
             );
             let selected = TextSelection::selected_text(window, cx);
             if plain {
-                assert_eq!(selected, "  alpha  \nbeta  ");
+                assert_eq!(selected, text);
             } else {
                 assert!(
                     selected.starts_with("alpha") && selected.contains("beta"),

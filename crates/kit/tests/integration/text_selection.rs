@@ -145,7 +145,7 @@ fn select_compatible_partial(
     assert!(!selected.trim().is_empty(), "real drag must select text");
     assert_ne!(selected.trim(), COMPATIBLE_SELECTION_CODE);
     assert!(COMPATIBLE_SELECTION_CODE.contains(selected.trim()));
-    assert_eq!(copy_selection(cx), selected.trim());
+    assert_eq!(copy_selection(cx), selected);
     let range = view.read_with(cx, |view, cx| {
         let state = view.text_view.read(cx);
         assert!(!state.is_selecting(), "selection must be ended");
@@ -186,7 +186,7 @@ fn color_style_change_keeps_finished_partial_selection_and_copy(cx: &mut TestApp
             state.read_with(cx, |state, _| state.selected_source_range()),
             Some(range.clone())
         );
-        assert_eq!(copy_selection(cx), selected.trim());
+        assert_eq!(copy_selection(cx), selected);
         assert_eq!(painted_background_bounds(NEW_COLOR, cx), old_backgrounds);
         assert!(painted_background_bounds(COMPATIBLE_SELECTION_COLOR, cx).is_empty());
     }
@@ -214,7 +214,7 @@ fn color_style_change_keeps_finished_partial_selection_and_copy(cx: &mut TestApp
     assert!(!replacement_selection.trim().is_empty());
     assert!(REPLACEMENT.contains(replacement_selection.trim()));
     assert_ne!(replacement_selection, selected);
-    assert_eq!(copy_selection(cx), replacement_selection.trim());
+    assert_eq!(copy_selection(cx), replacement_selection);
 }
 
 #[gpui_kit::test]
@@ -241,7 +241,7 @@ fn width_only_narrowing_keeps_finished_partial_selection_and_copy(cx: &mut TestA
             state.read_with(cx, |state, _| state.selected_source_range()),
             Some(range.clone())
         );
-        assert_eq!(copy_selection(cx), selected.trim());
+        assert_eq!(copy_selection(cx), selected);
     }
     let after = state.read_with(cx, |state, _| state.bounds());
     assert!(after.size.width < before.size.width);
@@ -271,7 +271,7 @@ fn width_only_narrowing_keeps_finished_partial_selection_and_copy(cx: &mut TestA
         state.read_with(cx, |state, _| state.selected_source_range()),
         Some(range)
     );
-    assert_eq!(copy_selection(cx), new_selection.trim());
+    assert_eq!(copy_selection(cx), new_selection);
 }
 
 #[gpui_kit::test]
@@ -300,7 +300,7 @@ fn font_and_width_reflow_then_outer_origin_shift_keeps_logical_partial_selection
             state.read_with(cx, |state, _| state.selected_source_range()),
             Some(range.clone())
         );
-        assert_eq!(copy_selection(cx), selected.trim());
+        assert_eq!(copy_selection(cx), selected);
     }
     let after = state.read_with(cx, |state, _| state.bounds());
     assert!(after.size.width < before.size.width);
@@ -330,7 +330,7 @@ fn font_and_width_reflow_then_outer_origin_shift_keeps_logical_partial_selection
             state.read_with(cx, |state, _| state.selected_source_range()),
             Some(range.clone())
         );
-        assert_eq!(copy_selection(cx), selected.trim());
+        assert_eq!(copy_selection(cx), selected);
     }
     let moved = state.read_with(cx, |state, _| state.bounds());
     assert_eq!(moved.origin, after.origin + point(px(0.), origin_shift));
@@ -360,7 +360,7 @@ fn font_and_width_reflow_then_outer_origin_shift_keeps_logical_partial_selection
         state.read_with(cx, |state, _| state.selected_source_range()),
         Some(range)
     );
-    assert_eq!(copy_selection(cx), reprojected.trim());
+    assert_eq!(copy_selection(cx), reprojected);
 }
 
 #[gpui_kit::test]
@@ -396,7 +396,7 @@ fn inherited_font_and_zoom_changes_keep_completed_selection(cx: &mut TestAppCont
     for _ in 0..3 {
         cx.update(|window, cx| window.draw(cx).clear(cx));
         assert_eq!(window_selected_text(cx), selected);
-        assert_eq!(copy_selection(cx), selected.trim());
+        assert_eq!(copy_selection(cx), selected);
         assert_eq!(
             state.read_with(cx, |state, _| state.selected_source_range()),
             Some(range.clone())
@@ -413,7 +413,7 @@ fn inherited_font_and_zoom_changes_keep_completed_selection(cx: &mut TestAppCont
     for _ in 0..3 {
         cx.update(|window, cx| window.draw(cx).clear(cx));
         assert_eq!(window_selected_text(cx), selected);
-        assert_eq!(copy_selection(cx), selected.trim());
+        assert_eq!(copy_selection(cx), selected);
     }
 }
 
@@ -513,7 +513,7 @@ fn highlighter_change_preserves_selection_but_parser_change_clears_it(cx: &mut T
     for _ in 0..3 {
         cx.update(|window, cx| window.draw(cx).clear(cx));
         assert_eq!(window_selected_text(cx), selected);
-        assert_eq!(copy_selection(cx), selected.trim());
+        assert_eq!(copy_selection(cx), selected);
         assert_eq!(
             state.read_with(cx, |state, _| state.selected_source_range()),
             Some(range.clone())

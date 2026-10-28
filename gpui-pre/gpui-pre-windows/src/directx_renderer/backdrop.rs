@@ -14,6 +14,7 @@ struct Params {
     bounds: [f32; 4],
     corners: [f32; 4],
     clip: [f32; 4],
+    rounded_clip: RoundedClipParams,
     source: [f32; 4],
     // xy = native-source UV step, z = sigma, w = 1 only for texel-aligned paired taps.
     kernel: [f32; 4],
@@ -342,6 +343,7 @@ impl DirectXRenderer {
                 blur.corner_radii.bottom_right.0,
                 blur.corner_radii.bottom_left.0,
             ],
+            rounded_clip: blur.clip,
             clip: rect(blur.content_mask.bounds),
             source: [
                 copy_x as f32,
@@ -387,6 +389,9 @@ impl DirectXRenderer {
                 viewport,
                 &params,
             )?;
+            unsafe {
+                context.PSSetShaderResources(1, Some(slice::from_ref(&scratch.snapshot.srv)));
+            }
             backdrop.draw_pass(
                 context,
                 &backdrop.composite,
@@ -397,7 +402,7 @@ impl DirectXRenderer {
             )
         })();
         unsafe {
-            context.PSSetShaderResources(0, Some(&[None]));
+            context.PSSetShaderResources(0, Some(&[None, None]));
             context.VSSetConstantBuffers(2, Some(&[None]));
             context.PSSetConstantBuffers(2, Some(&[None]));
             context.PSSetSamplers(0, Some(&[None]));
@@ -452,12 +457,13 @@ mod tests {
 
     #[::core::prelude::v1::test]
     fn params_match_hlsl_register_layout() {
-        assert_eq!(std::mem::size_of::<Params>(), 608);
+        assert_eq!(std::mem::size_of::<Params>(), 640);
         assert_eq!(std::mem::offset_of!(Params, bounds), 0);
         assert_eq!(std::mem::offset_of!(Params, corners), 16);
         assert_eq!(std::mem::offset_of!(Params, clip), 32);
-        assert_eq!(std::mem::offset_of!(Params, source), 48);
-        assert_eq!(std::mem::offset_of!(Params, kernel), 64);
-        assert_eq!(std::mem::offset_of!(Params, weights), 80);
+        assert_eq!(std::mem::offset_of!(Params, rounded_clip), 48);
+        assert_eq!(std::mem::offset_of!(Params, source), 80);
+        assert_eq!(std::mem::offset_of!(Params, kernel), 96);
+        assert_eq!(std::mem::offset_of!(Params, weights), 112);
     }
 }

@@ -44,7 +44,10 @@ pub(crate) use windows::Win32::Foundation::HWND;
 
 #[cfg(test)]
 mod tests {
-    use gpui::{EdgeFadeParams, MonochromeSprite, PolychromeSprite, Quad, SubpixelSprite};
+    use gpui::{
+        BackdropBlur, EdgeFadeParams, MonochromeSprite, PolychromeSprite, Quad, RoundedClipParams,
+        Shadow, SubpixelSprite, Underline,
+    };
     use std::mem::{align_of, offset_of, size_of};
 
     const SHADERS: &str = include_str!("shaders.hlsl");
@@ -71,8 +74,31 @@ mod tests {
 
     #[test]
     fn edge_fade_hlsl_layout_matches_scene_primitives() {
+        assert_eq!(align_of::<RoundedClipParams>(), align_of::<f32>());
+        assert_eq!(size_of::<RoundedClipParams>(), 32);
+        assert_eq!(offset_of!(RoundedClipParams, left), 0);
+        assert_eq!(offset_of!(RoundedClipParams, top), 4);
+        assert_eq!(offset_of!(RoundedClipParams, right), 8);
+        assert_eq!(offset_of!(RoundedClipParams, bottom), 12);
+        assert_eq!(offset_of!(RoundedClipParams, top_left), 16);
+        assert_eq!(offset_of!(RoundedClipParams, top_right), 20);
+        assert_eq!(offset_of!(RoundedClipParams, bottom_right), 24);
+        assert_eq!(offset_of!(RoundedClipParams, bottom_left), 28);
+        assert_fields_in_order(
+            hlsl_struct("RoundedClipParams"),
+            &[
+                "float left;",
+                "float top;",
+                "float right;",
+                "float bottom;",
+                "float top_left;",
+                "float top_right;",
+                "float bottom_right;",
+                "float bottom_left;",
+            ],
+        );
         assert_eq!(align_of::<EdgeFadeParams>(), align_of::<f32>());
-        assert_eq!(size_of::<EdgeFadeParams>(), 32);
+        assert_eq!(size_of::<EdgeFadeParams>(), 64);
         assert_eq!(offset_of!(EdgeFadeParams, top_y), 0);
         assert_eq!(offset_of!(EdgeFadeParams, bottom_y), 4);
         assert_eq!(offset_of!(EdgeFadeParams, band_top), 8);
@@ -81,6 +107,7 @@ mod tests {
         assert_eq!(offset_of!(EdgeFadeParams, right_x), 20);
         assert_eq!(offset_of!(EdgeFadeParams, band_left), 24);
         assert_eq!(offset_of!(EdgeFadeParams, band_right), 28);
+        assert_eq!(offset_of!(EdgeFadeParams, clip), 32);
         assert_fields_in_order(
             hlsl_struct("EdgeFadeParams"),
             &[
@@ -92,10 +119,11 @@ mod tests {
                 "float right_x;",
                 "float band_left;",
                 "float band_right;",
+                "RoundedClipParams clip;",
             ],
         );
         assert_eq!(offset_of!(Quad, fade), 160);
-        assert_eq!(size_of::<Quad>(), 192);
+        assert_eq!(size_of::<Quad>(), 224);
         assert_fields_in_order(
             hlsl_struct("Quad"),
             &[
@@ -112,8 +140,8 @@ mod tests {
         );
         assert_eq!(offset_of!(MonochromeSprite, fade), 112);
         assert_eq!(offset_of!(SubpixelSprite, fade), 112);
-        assert_eq!(size_of::<MonochromeSprite>(), 144);
-        assert_eq!(size_of::<SubpixelSprite>(), 144);
+        assert_eq!(size_of::<MonochromeSprite>(), 176);
+        assert_eq!(size_of::<SubpixelSprite>(), 176);
         assert_fields_in_order(
             hlsl_struct("MonochromeSprite"),
             &[
@@ -128,7 +156,7 @@ mod tests {
             ],
         );
         assert_eq!(offset_of!(PolychromeSprite, fade), 96);
-        assert_eq!(size_of::<PolychromeSprite>(), 128);
+        assert_eq!(size_of::<PolychromeSprite>(), 160);
         assert_fields_in_order(
             hlsl_struct("PolychromeSprite"),
             &[
@@ -141,6 +169,73 @@ mod tests {
                 "Bounds content_mask;",
                 "Corners corner_radii;",
                 "EdgeFadeParams fade;",
+            ],
+        );
+        assert_eq!(offset_of!(Shadow, clip), 112);
+        assert_eq!(size_of::<Shadow>(), 144);
+        assert_fields_in_order(
+            hlsl_struct("Shadow"),
+            &[
+                "uint order;",
+                "float blur_radius;",
+                "Bounds bounds;",
+                "Corners corner_radii;",
+                "Bounds content_mask;",
+                "Hsla color;",
+                "Bounds element_bounds;",
+                "Corners element_corner_radii;",
+                "uint inset;",
+                "uint pad;",
+                "RoundedClipParams clip;",
+            ],
+        );
+        assert_eq!(offset_of!(Underline, clip), 64);
+        assert_eq!(size_of::<Underline>(), 96);
+        assert_fields_in_order(
+            hlsl_struct("Underline"),
+            &[
+                "uint order;",
+                "uint pad;",
+                "Bounds bounds;",
+                "Bounds content_mask;",
+                "Hsla color;",
+                "float thickness;",
+                "uint wavy;",
+                "RoundedClipParams clip;",
+            ],
+        );
+        assert_fields_in_order(
+            hlsl_struct("PathRasterizationSprite"),
+            &[
+                "float2 xy_position;",
+                "float2 st_position;",
+                "Background color;",
+                "Bounds bounds;",
+            ],
+        );
+        assert_fields_in_order(
+            hlsl_struct("PathSprite"),
+            &["Bounds bounds;", "RoundedClipParams clip;"],
+        );
+        assert_eq!(offset_of!(BackdropBlur, clip), 56);
+        assert_eq!(size_of::<BackdropBlur>(), 88);
+        let backdrop = SHADERS
+            .split_once("cbuffer BackdropParams: register(b2) {")
+            .expect("missing HLSL BackdropParams")
+            .1
+            .split_once("};")
+            .expect("unterminated HLSL BackdropParams")
+            .0;
+        assert_fields_in_order(
+            backdrop,
+            &[
+                "Bounds backdrop_bounds;",
+                "Corners backdrop_corners;",
+                "Bounds backdrop_clip;",
+                "RoundedClipParams backdrop_rounded_clip;",
+                "float4 backdrop_source;",
+                "float4 backdrop_kernel;",
+                "float4 backdrop_weights[33];",
             ],
         );
     }

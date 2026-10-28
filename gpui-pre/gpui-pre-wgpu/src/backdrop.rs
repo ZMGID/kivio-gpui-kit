@@ -247,6 +247,7 @@ impl WgpuRendererCore {
                     scratch.width as f32,
                     scratch.height as f32,
                 ],
+                clip: blur.clip.into(),
             }),
         );
         let h_group = Self::backdrop_bind_group(
@@ -254,12 +255,14 @@ impl WgpuRendererCore {
             h_offset,
             std::mem::size_of::<BlurPassUniform>() as u64,
             &scratch.snapshot_view,
+            &scratch.snapshot_view,
         );
         let v_group = Self::backdrop_bind_group(
             resources,
             v_offset,
             std::mem::size_of::<BlurPassUniform>() as u64,
             &scratch.blur_a_view,
+            &scratch.snapshot_view,
         );
         for (view, group, region) in [
             (&scratch.blur_a_view, &h_group, horizontal_region),
@@ -307,6 +310,7 @@ impl WgpuRendererCore {
             offset,
             std::mem::size_of::<BackdropBlurUniform>() as u64,
             &scratch.blur_b_view,
+            &scratch.snapshot_view,
         );
         pass.set_pipeline(&resources.pipelines.backdrop_composite);
         pass.set_bind_group(0, &resources.globals_bind_group, &[]);
@@ -319,6 +323,7 @@ impl WgpuRendererCore {
         offset: u64,
         size: u64,
         source: &wgpu::TextureView,
+        snapshot: &wgpu::TextureView,
     ) -> wgpu::BindGroup {
         resources
             .device
@@ -344,6 +349,10 @@ impl WgpuRendererCore {
                     wgpu::BindGroupEntry {
                         binding: 2,
                         resource: wgpu::BindingResource::Sampler(&resources.backdrop_sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(snapshot),
                     },
                 ],
             })

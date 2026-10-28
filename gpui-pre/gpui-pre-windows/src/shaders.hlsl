@@ -40,6 +40,17 @@ struct Edges {
     float bottom;
     float left;
 };
+struct RoundedClipParams {
+    float left;
+    float top;
+    float right;
+    float bottom;
+    float top_left;
+    float top_right;
+    float bottom_right;
+    float bottom_left;
+};
+
 
 struct EdgeFadeParams {
     float top_y;
@@ -50,6 +61,7 @@ struct EdgeFadeParams {
     float right_x;
     float band_left;
     float band_right;
+    RoundedClipParams clip;
 };
 
 struct Hsla {
@@ -108,6 +120,23 @@ struct TransformationMatrix {
 
 static const float M_PI_F = 3.141592653f;
 static const float3 GRAYSCALE_FACTORS = float3(0.2126f, 0.7152f, 0.0722f);
+// Rounded-rectangle SDF adapted from zui crates/gpui_windows/src/shaders.hlsl,
+// b564a34413bb7ef1da04121c4a287758f94993d9 (Apache-2.0).
+float rounded_clip_alpha(float2 position, RoundedClipParams clip) {
+    if (clip.right <= clip.left) {
+        return 1.0;
+    }
+    float2 half_size = float2(clip.right - clip.left, clip.bottom - clip.top) * 0.5;
+    float2 center = float2(clip.left, clip.top) + half_size;
+    float2 center_to_point = position - center;
+    float radius = center_to_point.x < 0.0
+        ? (center_to_point.y < 0.0 ? clip.top_left : clip.bottom_left)
+        : (center_to_point.y < 0.0 ? clip.top_right : clip.bottom_right);
+    float2 q = abs(center_to_point) - half_size + radius;
+    float distance = length(max(q, float2(0.0, 0.0))) + min(max(q.x, q.y), 0.0) - radius;
+    return saturate(0.5 - distance);
+}
+
 
 float edge_fade_alpha(float2 position, EdgeFadeParams fade) {
     float ramp = 1.0;
@@ -123,7 +152,7 @@ float edge_fade_alpha(float2 position, EdgeFadeParams fade) {
     if (fade.band_right > 0.0) {
         ramp = min(ramp, clamp((fade.right_x - position.x) / fade.band_right, 0.0, 1.0));
     }
-    return ramp * ramp;
+    return ramp * ramp * rounded_clip_alpha(position, fade.clip);
 }
 
 float4 to_device_position_impl(float2 position) {
@@ -894,6 +923,7 @@ struct Shadow {
     Corners element_corner_radii;
     uint inset;
     uint pad; // align to 8 bytes
+    RoundedClipParams clip;
 };
 
 struct ShadowVertexOutput {
@@ -980,7 +1010,7 @@ float4 shadow_fragment(ShadowFragmentInput input): SV_TARGET {
         alpha *= saturate(0.5 - element_distance);
     }
 
-    return input.color * float4(1., 1., 1., alpha);
+    return input.color * float4(1., 1., 1., alpha * rounded_clip_alpha(input.position.xy, shadow.clip));
 }
 
 /*
@@ -1057,11 +1087,13 @@ float4 path_rasterization_fragment(PathFragmentInput input): SV_Target {
 
 struct PathSprite {
     Bounds bounds;
+    RoundedClipParams clip;
 };
 
 struct PathSpriteVertexOutput {
     float4 position: SV_Position;
     float2 texture_coords: TEXCOORD0;
+    nointerpolation uint sprite_id: TEXCOORD1;
 };
 
 StructuredBuffer<PathSprite> path_sprites: register(t1);
@@ -1079,11 +1111,13 @@ PathSpriteVertexOutput path_sprite_vertex(uint vertex_id: SV_VertexID, uint spri
     PathSpriteVertexOutput output;
     output.position = device_position;
     output.texture_coords = texture_coords;
+    output.sprite_id = sprite_id;
     return output;
 }
 
 float4 path_sprite_fragment(PathSpriteVertexOutput input): SV_Target {
-    return t_sprite.Sample(s_sprite, input.texture_coords);
+    float coverage = rounded_clip_alpha(input.position.xy, path_sprites[input.sprite_id].clip);
+    return t_sprite.Sample(s_sprite, input.texture_coords) * coverage;
 }
 
 /*
@@ -1100,6 +1134,7 @@ struct Underline {
     Hsla color;
     float thickness;
     uint wavy;
+    RoundedClipParams clip;
 };
 
 struct UnderlineVertexOutput {
@@ -1155,9 +1190,9 @@ float4 underline_fragment(UnderlineFragmentInput input): SV_Target {
         float distance_from_bottom_border = distance_in_pixels + half_thickness;
         float alpha = saturate(
             0.5 - max(-distance_from_bottom_border, distance_from_top_border));
-        return input.color * float4(1., 1., 1., alpha);
+        return input.color * float4(1., 1., 1., alpha * rounded_clip_alpha(input.position.xy, underline.clip));
     } else {
-        return input.color;
+        return input.color * float4(1., 1., 1., rounded_clip_alpha(input.position.xy, underline.clip));
     }
 }
 
@@ -1308,10 +1343,13 @@ cbuffer BackdropParams: register(b2) {
     Bounds backdrop_bounds;
     Corners backdrop_corners;
     Bounds backdrop_clip;
+    RoundedClipParams backdrop_rounded_clip;
     float4 backdrop_source;
     float4 backdrop_kernel;
     float4 backdrop_weights[33];
 };
+
+Texture2D<float4> t_backdrop_snapshot: register(t1);
 
 struct BackdropVertex {
     float4 position: SV_Position;
@@ -1378,6 +1416,15 @@ float4 backdrop_composite_fragment(BackdropVertex input): SV_Target {
         || quad_sdf(position, backdrop_bounds, backdrop_corners) > 0.) {
         discard;
     }
+    float coverage = rounded_clip_alpha(position, backdrop_rounded_clip);
+    if (coverage <= 0.) {
+        discard;
+    }
     float2 uv = (position - backdrop_source.xy) / backdrop_source.zw;
-    return t_sprite.SampleLevel(s_sprite, uv, 0.);
+    float4 blurred = t_sprite.SampleLevel(s_sprite, uv, 0.);
+    if (coverage >= 1.) {
+        return blurred;
+    }
+    float4 snapshot = t_backdrop_snapshot.Load(int3(int2(position - backdrop_source.xy), 0));
+    return lerp(snapshot, blurred, coverage);
 }

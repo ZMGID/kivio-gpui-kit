@@ -107,6 +107,7 @@ fn blur(order: u32) -> BackdropBlur {
             bounds: bounds(0., 0., 64., 64.),
         },
         corner_radii: Corners::all(ScaledPixels(8.)),
+        clip: RoundedClipParams::default(),
     }
 }
 
@@ -1388,4 +1389,439 @@ fn warp_invalid_geometry_allocates_nothing_and_idle_cache_expires() -> Result<()
     }
     assert!(renderer.resources.as_ref().unwrap().backdrop.is_none());
     Ok(())
+}
+
+fn rounded_clip_fixture(scale: f32) -> RoundedClipParams {
+    RoundedClipParams {
+        left: 8.25 * scale,
+        top: 8.25 * scale,
+        right: 55.75 * scale,
+        bottom: 55.75 * scale,
+        top_left: 18. * scale,
+        top_right: 0.,
+        bottom_right: 12. * scale,
+        bottom_left: 5. * scale,
+    }
+}
+
+fn rounded_clip_coverage(clip: RoundedClipParams, x: usize, y: usize) -> f32 {
+    if clip.right <= clip.left {
+        return 1.;
+    }
+    let half_x = (clip.right - clip.left) * 0.5;
+    let half_y = (clip.bottom - clip.top) * 0.5;
+    let dx = x as f32 + 0.5 - (clip.left + half_x);
+    let dy = y as f32 + 0.5 - (clip.top + half_y);
+    let radius = match (dx < 0., dy < 0.) {
+        (true, true) => clip.top_left,
+        (false, true) => clip.top_right,
+        (false, false) => clip.bottom_right,
+        (true, false) => clip.bottom_left,
+    };
+    let qx = dx.abs() - half_x + radius;
+    let qy = dy.abs() - half_y + radius;
+    let distance = qx.max(0.).hypot(qy.max(0.)) + qx.max(qy).min(0.) - radius;
+    (0.5 - distance).clamp(0., 1.)
+}
+
+fn assert_rounded_clip(
+    renderer: &mut DirectXRenderer,
+    scene: &mut Scene,
+    appearance: WindowBackgroundAppearance,
+    clip: RoundedClipParams,
+    apply: impl FnOnce(&mut Scene, RoundedClipParams),
+) -> Result<Vec<[u8; 4]>> {
+    renderer.render(scene, appearance)?;
+    let reference = pixels(renderer)?;
+    apply(scene, clip);
+    renderer.render(scene, appearance)?;
+    let actual = pixels(renderer)?;
+    let clear = match appearance {
+        WindowBackgroundAppearance::Opaque => 255.,
+        _ => 0.,
+    };
+    let mut samples = [false; 3];
+    for y in 0..64 {
+        for x in 0..64 {
+            let coverage = rounded_clip_coverage(clip, x, y);
+            let index = y * 64 + x;
+            let visible = reference[index]
+                .iter()
+                .any(|channel| (*channel as f32 - clear).abs() > 16.);
+            if visible {
+                if coverage == 0. {
+                    samples[0] = true;
+                } else if coverage < 0.9 {
+                    samples[1] = true;
+                } else if coverage == 1. {
+                    samples[2] = true;
+                }
+            }
+            for channel in 0..4 {
+                let expected = clear + (reference[index][channel] as f32 - clear) * coverage;
+                assert!(
+                    (actual[index][channel] as f32 - expected).abs() <= 4.,
+                    "({x},{y}) channel {channel}, coverage {coverage}: {:?} versus {:?}",
+                    actual[index],
+                    reference[index]
+                );
+            }
+        }
+    }
+    assert_eq!(
+        samples, [true; 3],
+        "fixture must cover outside, antialiased and inside pixels"
+    );
+    Ok(actual)
+}
+
+#[::core::prelude::v1::test]
+fn warp_rounded_clip_covers_distinct_corners_and_faded_borders() -> Result<()> {
+    let (mut renderer, _window) = warp_renderer()?;
+    for (scale, bordered) in [(1., false), (1., true), (1.1, true)] {
+        let mut scene = Scene::default();
+        let mut item = quad(0, bounds(0., 0., 64., 64.), hsla(2. / 3., 1., 0.5, 0.4));
+        if bordered {
+            item.border_widths = Edges::all(ScaledPixels(10.));
+            item.border_color = hsla(0., 1., 0.5, 0.5);
+        }
+        item.fade.top_y = -20.;
+        item.fade.band_top = 40.;
+        scene.quads.push(item);
+        let actual = assert_rounded_clip(
+            &mut renderer,
+            &mut scene,
+            WindowBackgroundAppearance::Transparent,
+            rounded_clip_fixture(scale),
+            |scene, clip| scene.quads[0].fade.clip = clip,
+        )?;
+        if scale == 1. {
+            assert_eq!(actual[9 * 64 + 9][3], 0);
+            assert!(actual[9 * 64 + 54][3] > 40);
+            assert_eq!(actual[54 * 64 + 54][3], 0);
+            assert!((10..80).contains(&actual[54 * 64 + 9][3]));
+        }
+    }
+    let mut scene = Scene::default();
+    let mut item = quad(0, bounds(0., 0., 64., 64.), hsla(0., 0., 1., 0.7));
+    item.content_mask.bounds = bounds(16., 0., 32., 64.);
+    item.fade.clip = rounded_clip_fixture(1.);
+    scene.quads.push(item);
+    renderer.render(&scene, WindowBackgroundAppearance::Transparent)?;
+    let masked = pixels(&renderer)?;
+    assert_eq!(masked[32 * 64 + 15][3], 0);
+    assert!(masked[32 * 64 + 16][3] > 150);
+    Ok(())
+}
+
+#[::core::prelude::v1::test]
+fn warp_rounded_clip_applies_to_glyphs_subpixel_and_images() -> Result<()> {
+    let (mut renderer, _window) = warp_renderer()?;
+    let tile_size = size(DevicePixels(8), DevicePixels(8));
+    for kind in 0..3 {
+        let (key, bytes) = match kind {
+            0 => (
+                AtlasKey::Svg(RenderSvgParams {
+                    path: "rounded-clip-glyph".into(),
+                    size: tile_size,
+                }),
+                vec![255; 64],
+            ),
+            1 => (
+                AtlasKey::Glyph(RenderGlyphParams {
+                    font_id: FontId(100),
+                    glyph_id: GlyphId(1),
+                    font_size: px(12.),
+                    subpixel_variant: point(0, 0),
+                    scale_factor: 1.,
+                    is_emoji: false,
+                    subpixel_rendering: true,
+                    dilation: 0,
+                }),
+                [255, 210, 150, 255].repeat(64),
+            ),
+            _ => (
+                AtlasKey::Image(RenderImageParams {
+                    image_id: ImageId(1003),
+                    frame_index: 0,
+                }),
+                [40, 90, 180, 192].repeat(64),
+            ),
+        };
+        let tile = renderer
+            .atlas
+            .get_or_insert_with(key, &mut || {
+                Ok(Some((tile_size, std::borrow::Cow::Borrowed(&bytes))))
+            })?
+            .unwrap();
+        let mut scene = Scene::default();
+        let content_mask = ContentMask {
+            bounds: bounds(0., 0., 64., 64.),
+        };
+        let fade = EdgeFadeParams {
+            top_y: -20.,
+            band_top: 40.,
+            ..Default::default()
+        };
+        let transformation = TransformationMatrix {
+            translation: [3., 2.],
+            ..Default::default()
+        };
+        match kind {
+            0 => scene.monochrome_sprites.push(MonochromeSprite {
+                order: 0,
+                pad: 0,
+                tile,
+                bounds: bounds(-3., -2., 64., 64.),
+                content_mask,
+                color: hsla(0., 0., 0., 0.6),
+                transformation,
+                fade,
+            }),
+            1 => scene.subpixel_sprites.push(SubpixelSprite {
+                order: 0,
+                pad: 0,
+                tile,
+                bounds: bounds(-3., -2., 64., 64.),
+                content_mask,
+                color: hsla(0., 0., 0., 0.6),
+                transformation,
+                fade,
+            }),
+            _ => scene.polychrome_sprites.push(PolychromeSprite {
+                order: 0,
+                pad: 0,
+                tile,
+                grayscale: false.into(),
+                opacity: 0.6,
+                bounds: bounds(0., 0., 64., 64.),
+                content_mask,
+                corner_radii: Corners::default(),
+                fade,
+            }),
+        }
+        let appearance = if kind == 1 {
+            WindowBackgroundAppearance::Opaque
+        } else {
+            WindowBackgroundAppearance::Transparent
+        };
+        assert_rounded_clip(
+            &mut renderer,
+            &mut scene,
+            appearance,
+            rounded_clip_fixture(1.),
+            |scene, clip| match kind {
+                0 => scene.monochrome_sprites[0].fade.clip = clip,
+                1 => scene.subpixel_sprites[0].fade.clip = clip,
+                _ => scene.polychrome_sprites[0].fade.clip = clip,
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn test_path(color: Hsla, order: u32) -> Path<ScaledPixels> {
+    let mut path = Path::new(point(px(0.), px(0.)));
+    path.line_to(point(px(64.), px(0.)));
+    path.line_to(point(px(64.), px(64.)));
+    path.line_to(point(px(0.), px(64.)));
+    let mut path = path.scale(1.);
+    path.order = order;
+    path.color = color.into();
+    path.content_mask.bounds = bounds(0., 0., 64., 64.);
+    path
+}
+
+#[::core::prelude::v1::test]
+fn warp_rounded_clip_applies_to_shadows_underlines_and_paths() -> Result<()> {
+    let (mut renderer, _window) = warp_renderer()?;
+    let viewport = bounds(0., 0., 64., 64.);
+    for inset in [false, true] {
+        let mut scene = Scene::default();
+        scene.shadows.push(Shadow {
+            order: 0,
+            blur_radius: ScaledPixels(3.),
+            bounds: if inset {
+                bounds(20., 20., 24., 24.)
+            } else {
+                bounds(-16., -16., 96., 96.)
+            },
+            corner_radii: Corners::default(),
+            content_mask: ContentMask { bounds: viewport },
+            color: hsla(0., 0., 1., 0.65),
+            element_bounds: viewport,
+            element_corner_radii: Corners::default(),
+            inset: u32::from(inset),
+            pad: 0,
+            clip: RoundedClipParams::default(),
+        });
+        assert_rounded_clip(
+            &mut renderer,
+            &mut scene,
+            WindowBackgroundAppearance::Transparent,
+            rounded_clip_fixture(1.),
+            |scene, clip| scene.shadows[0].clip = clip,
+        )?;
+    }
+
+    for wavy in [false, true] {
+        let mut scene = Scene::default();
+        scene.underlines.push(Underline {
+            order: 0,
+            pad: 0,
+            bounds: viewport,
+            content_mask: ContentMask { bounds: viewport },
+            color: hsla(0., 0., 1., 0.65),
+            thickness: ScaledPixels(12.),
+            wavy: wavy.into(),
+            clip: RoundedClipParams::default(),
+        });
+        assert_rounded_clip(
+            &mut renderer,
+            &mut scene,
+            WindowBackgroundAppearance::Transparent,
+            rounded_clip_fixture(1.),
+            |scene, clip| scene.underlines[0].clip = clip,
+        )?;
+    }
+
+    for duplicate_triangles in [false, true] {
+        let mut scene = Scene::default();
+        let mut path = test_path(hsla(0., 0., 1., 0.65), 0);
+        if duplicate_triangles {
+            path.vertices.extend_from_within(..);
+        }
+        scene.paths.push(path);
+        assert_rounded_clip(
+            &mut renderer,
+            &mut scene,
+            WindowBackgroundAppearance::Transparent,
+            rounded_clip_fixture(1.),
+            |scene, clip| scene.paths[0].clip = clip,
+        )?;
+    }
+    Ok(())
+}
+
+#[::core::prelude::v1::test]
+fn warp_rounded_clips_apply_before_overlapping_paths_are_composited() -> Result<()> {
+    let (mut renderer, _window) = warp_renderer()?;
+    let mut first = test_path(hsla(2. / 3., 1., 0.5, 0.65), 0);
+    first.clip = rounded_clip_fixture(1.);
+    let middle = test_path(hsla(1. / 3., 1., 0.5, 0.4), 1);
+    let mut last = test_path(hsla(0., 1., 0.5, 0.65), 2);
+    last.clip = RoundedClipParams {
+        left: 16.25,
+        top: 4.25,
+        right: 60.75,
+        bottom: 51.75,
+        top_left: 3.,
+        top_right: 14.,
+        bottom_right: 0.,
+        bottom_left: 18.,
+    };
+    let mut scene = Scene::default();
+    scene.paths.push(first.clone());
+    renderer.render(&scene, WindowBackgroundAppearance::Transparent)?;
+    let behind = pixels(&renderer)?;
+    scene.paths[0] = middle.clone();
+    renderer.render(&scene, WindowBackgroundAppearance::Transparent)?;
+    let between = pixels(&renderer)?;
+    scene.paths[0] = last.clone();
+    renderer.render(&scene, WindowBackgroundAppearance::Transparent)?;
+    let front = pixels(&renderer)?;
+    scene.paths = vec![first, middle, last];
+    renderer.render(&scene, WindowBackgroundAppearance::Transparent)?;
+    let combined = pixels(&renderer)?;
+    for y in 6..58 {
+        for x in 6..58 {
+            let index = y * 64 + x;
+            let remaining = 1. - front[index][3] as f32 / 255.;
+            let middle_remaining = 1. - between[index][3] as f32 / 255.;
+            for channel in 0..4 {
+                let expected = front[index][channel] as f32
+                    + (between[index][channel] as f32
+                        + behind[index][channel] as f32 * middle_remaining)
+                        * remaining;
+                assert!(
+                    (combined[index][channel] as f32 - expected).abs() <= 4.,
+                    "path order at ({x},{y}): {:?} over {:?} over {:?} yielded {:?}",
+                    front[index],
+                    between[index],
+                    behind[index],
+                    combined[index]
+                );
+            }
+        }
+    }
+    assert!(combined[32 * 64 + 32][2] > combined[32 * 64 + 32][0]);
+    Ok(())
+}
+
+#[::core::prelude::v1::test]
+fn warp_rounded_backdrop_mixes_snapshot_and_keeps_later_content() -> Result<()> {
+    let (mut renderer, _window) = warp_renderer()?;
+    let mut scene = Scene::default();
+    scene
+        .quads
+        .push(quad(0, bounds(0., 0., 32., 64.), hsla(0., 1., 0.5, 0.35)));
+    scene.quads.push(quad(
+        0,
+        bounds(32., 0., 32., 64.),
+        hsla(2. / 3., 1., 0.5, 0.8),
+    ));
+    renderer.render(&scene, WindowBackgroundAppearance::Transparent)?;
+    let snapshot = pixels(&renderer)?;
+    let mut region = blur(1);
+    region.bounds = bounds(0., 0., 64., 64.);
+    region.corner_radii = Corners::default();
+    scene.backdrop_blurs.push(region);
+    renderer.render(&scene, WindowBackgroundAppearance::Transparent)?;
+    let blurred = pixels(&renderer)?;
+    let clip = rounded_clip_fixture(1.);
+    scene.backdrop_blurs[0].clip = clip;
+    renderer.render(&scene, WindowBackgroundAppearance::Transparent)?;
+    let clipped = pixels(&renderer)?;
+    let mut partial_effect = false;
+    for y in 0..64 {
+        for x in 0..64 {
+            let index = y * 64 + x;
+            let coverage = rounded_clip_coverage(clip, x, y);
+            for channel in 0..4 {
+                let before = snapshot[index][channel] as f32;
+                let after = blurred[index][channel] as f32;
+                let expected = before + (after - before) * coverage;
+                if coverage > 0.1 && coverage < 0.9 && (before - after).abs() > 16. {
+                    partial_effect = true;
+                }
+                assert!(
+                    (clipped[index][channel] as f32 - expected).abs() <= 2.,
+                    "backdrop at ({x},{y}) channel {channel}: {:?}, {:?}, {:?}",
+                    snapshot[index],
+                    blurred[index],
+                    clipped[index]
+                );
+            }
+        }
+    }
+    assert!(
+        partial_effect,
+        "fixture must exercise partial blur coverage"
+    );
+    scene.quads.push(quad(
+        1,
+        bounds(28., 28., 8., 8.),
+        hsla(1. / 3., 1., 0.5, 1.),
+    ));
+    renderer.render(&scene, WindowBackgroundAppearance::Transparent)?;
+    assert_eq!(pixels(&renderer)?[32 * 64 + 32], [0, 255, 0, 255]);
+    Ok(())
+}
+
+#[::core::prelude::v1::test]
+fn path_sprite_clip_layout_matches_hlsl() {
+    assert_eq!(std::mem::offset_of!(PathRasterizationSprite, bounds), 88);
+    assert_eq!(std::mem::size_of::<PathRasterizationSprite>(), 104);
+    assert_eq!(std::mem::offset_of!(PathSprite, clip), 16);
+    assert_eq!(std::mem::size_of::<PathSprite>(), 48);
 }

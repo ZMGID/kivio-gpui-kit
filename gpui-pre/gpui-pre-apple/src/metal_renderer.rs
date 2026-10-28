@@ -4,7 +4,7 @@ use block2::RcBlock;
 use core_graphics::geometry::CGSize;
 use gpui::{
     AtlasTextureId, BackdropBlur, Background, Bounds, ContentMask, DevicePixels, PaintSurface,
-    Path, Point, PrimitiveBatch, ScaledPixels, Scene, Size, point, size,
+    Path, Point, PrimitiveBatch, RoundedClipParams, ScaledPixels, Scene, Size, point, size,
 };
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 use image::RgbaImage;
@@ -844,31 +844,36 @@ impl MetalRenderer {
                 }
                 PrimitiveBatch::Paths(range) => {
                     let paths = &scene.paths[range];
-                    command_encoder.end_encoding();
+                    let clipped = paths.iter().any(|path| path.clip.right > path.clip.left);
+                    // Disjoint paths at the same order can share a raster pass; different
+                    // orders need separate composites so each rounded clip applies once.
+                    for group in paths.chunk_by(|a, b| !clipped || a.order == b.order) {
+                        command_encoder.end_encoding();
 
-                    let did_draw = self.draw_paths_to_intermediate(
-                        paths,
-                        writer,
-                        viewport_size,
-                        command_buffer,
-                    )?;
-
-                    command_encoder = new_command_encoder_for_texture(
-                        command_buffer,
-                        texture,
-                        viewport_size,
-                        None,
-                    );
-
-                    if did_draw {
-                        if let Err(error) = self.draw_paths_from_intermediate(
-                            paths,
+                        let did_draw = self.draw_paths_to_intermediate(
+                            group,
                             writer,
                             viewport_size,
-                            command_encoder,
-                        ) {
-                            command_encoder.end_encoding();
-                            return Err(error);
+                            command_buffer,
+                        )?;
+
+                        command_encoder = new_command_encoder_for_texture(
+                            command_buffer,
+                            texture,
+                            viewport_size,
+                            None,
+                        );
+
+                        if did_draw {
+                            if let Err(error) = self.draw_paths_from_intermediate(
+                                group,
+                                writer,
+                                viewport_size,
+                                command_encoder,
+                            ) {
+                                command_encoder.end_encoding();
+                                return Err(error);
+                            }
                         }
                     }
                 }
@@ -1013,6 +1018,10 @@ impl MetalRenderer {
         );
         command_encoder
             .set_fragment_texture(BackdropBlurInputIndex::SourceTexture as u64, Some(&blurred));
+        command_encoder.set_fragment_texture(
+            BackdropBlurInputIndex::SnapshotTexture as u64,
+            Some(&scratch),
+        );
         command_encoder.draw_primitives_instanced_base_instance(
             metal::MTLPrimitiveType::Triangle,
             0,
@@ -1309,6 +1318,7 @@ impl MetalRenderer {
                 .iter()
                 .map(|path| PathSprite {
                     bounds: path.clipped_bounds(),
+                    clip: path.clip,
                 })
                 .collect();
         } else {
@@ -1316,11 +1326,19 @@ impl MetalRenderer {
             for path in paths.iter().skip(1) {
                 bounds = bounds.union(&path.clipped_bounds());
             }
-            sprites = vec![PathSprite { bounds }];
+            sprites = vec![PathSprite {
+                bounds,
+                clip: RoundedClipParams::default(),
+            }];
         }
 
         let sprite_instance_bindings = writer.write(&sprites)?;
         command_encoder.set_vertex_buffer(
+            SpriteInputIndex::Sprites as u64,
+            Some(&sprite_instance_bindings.buffer),
+            sprite_instance_bindings.offset as u64,
+        );
+        command_encoder.set_fragment_buffer(
             SpriteInputIndex::Sprites as u64,
             Some(&sprite_instance_bindings.buffer),
             sprite_instance_bindings.offset as u64,
@@ -1508,6 +1526,11 @@ impl MetalRenderer {
             0,
         );
         command_encoder.set_vertex_buffer(
+            SurfaceInputIndex::Surfaces as u64,
+            Some(&instance_bindings.surfaces.buffer),
+            instance_bindings.surfaces.offset as u64,
+        );
+        command_encoder.set_fragment_buffer(
             SurfaceInputIndex::Surfaces as u64,
             Some(&instance_bindings.surfaces.buffer),
             instance_bindings.surfaces.offset as u64,
@@ -1866,6 +1889,7 @@ fn write_instances(scene: &Scene, writer: &mut InstanceBufferWriter) -> Result<I
         surfaces: writer.write_iter(scene.surfaces.iter().map(|surface| SurfaceBounds {
             bounds: surface.bounds,
             content_mask: surface.content_mask,
+            clip: surface.clip,
         }))?,
     })
 }
@@ -2015,6 +2039,7 @@ enum BackdropBlurInputIndex {
     ViewportSize = 2,
     SourceTexture = 3,
     SourceRect = 4,
+    SnapshotTexture = 5,
 }
 
 #[repr(C)]
@@ -2056,17 +2081,19 @@ enum PathRasterizationInputIndex {
     ViewportSize = 1,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 #[repr(C)]
 pub struct PathSprite {
     pub bounds: Bounds<ScaledPixels>,
+    pub clip: RoundedClipParams,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 #[repr(C)]
 pub struct SurfaceBounds {
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
+    pub clip: RoundedClipParams,
 }
 
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
@@ -2160,6 +2187,7 @@ mod tests {
             order: 0,
             bounds,
             content_mask: ContentMask { bounds },
+            clip: RoundedClipParams::default(),
             image_buffer: image_buffer.clone(),
         });
         drop(image_buffer);
@@ -2175,6 +2203,31 @@ mod tests {
             assert!(blue.abs_diff(128) <= 2);
             assert_eq!(*alpha, 255);
         }
+
+        renderer.opaque = false;
+        scene.surfaces[0].clip = RoundedClipParams {
+            left: 0.,
+            top: 0.,
+            right: 16.,
+            bottom: 16.,
+            top_left: 6.,
+            top_right: 0.,
+            bottom_right: 6.,
+            bottom_left: 0.,
+        };
+        let clipped = renderer
+            .render_scene_to_image(&scene, size(DevicePixels(16), DevicePixels(16)))
+            .unwrap();
+        assert_eq!(clipped.get_pixel(0, 0)[3], 0);
+        assert_eq!(clipped.get_pixel(15, 15)[3], 0);
+        assert_eq!(clipped.get_pixel(15, 0)[3], 255);
+        assert_eq!(clipped.get_pixel(0, 15)[3], 255);
+        assert_eq!(clipped.get_pixel(8, 8)[3], 255);
+        let edge = clipped.get_pixel(1, 1);
+        assert!(edge[3] > 0 && edge[3] < 255, "surface edge: {edge:?}");
+        for channel in 0..3 {
+            assert!((edge[channel] as i32 * 2 - edge[3] as i32).abs() <= 3);
+        }
     }
 }
 
@@ -2182,8 +2235,9 @@ mod tests {
 mod backdrop_blur_tests {
     use super::*;
     use gpui::{
-        Corners, DrawOrder, EdgeFadeParams, Edges, MonochromeSprite, PlatformAtlas, Quad,
-        RenderSvgParams, TransformationMatrix, rgba, solid_background,
+        Corners, DrawOrder, EdgeFadeParams, Edges, FontId, GlyphId, ImageId, MonochromeSprite,
+        PlatformAtlas, PolychromeSprite, Quad, RenderGlyphParams, RenderImageParams,
+        RenderSvgParams, Shadow, TransformationMatrix, Underline, px, rgba, solid_background,
     };
     use std::borrow::Cow;
 
@@ -2191,6 +2245,19 @@ mod backdrop_blur_tests {
         Bounds {
             origin: point(ScaledPixels(x), ScaledPixels(y)),
             size: size(ScaledPixels(width), ScaledPixels(height)),
+        }
+    }
+
+    fn rounded_clip() -> RoundedClipParams {
+        RoundedClipParams {
+            left: 10.,
+            top: 10.,
+            right: 50.,
+            bottom: 50.,
+            top_left: 12.,
+            top_right: 0.,
+            bottom_right: 4.,
+            bottom_left: 0.,
         }
     }
 
@@ -2211,6 +2278,7 @@ mod backdrop_blur_tests {
             bounds,
             content_mask: ContentMask { bounds },
             corner_radii: Corners::default(),
+            clip: RoundedClipParams::default(),
         }
     }
 
@@ -2232,12 +2300,13 @@ mod backdrop_blur_tests {
 
     #[test]
     fn backdrop_shader_bindings_match_scene_layout() {
-        assert_eq!(mem::size_of::<BackdropBlur>(), 56);
+        assert_eq!(mem::size_of::<BackdropBlur>(), 88);
         assert_eq!(mem::offset_of!(BackdropBlur, order), 0);
         assert_eq!(mem::offset_of!(BackdropBlur, blur_radius), 4);
         assert_eq!(mem::offset_of!(BackdropBlur, bounds), 8);
         assert_eq!(mem::offset_of!(BackdropBlur, content_mask), 24);
         assert_eq!(mem::offset_of!(BackdropBlur, corner_radii), 40);
+        assert_eq!(mem::offset_of!(BackdropBlur, clip), 56);
         let header = include_str!(concat!(env!("OUT_DIR"), "/scene.h"));
         let definition = header
             .split("struct BackdropBlur {")
@@ -2252,6 +2321,7 @@ mod backdrop_blur_tests {
             "bounds",
             "content_mask",
             "corner_radii",
+            "clip",
         ]
         .map(|field| definition.find(field).expect("missing backdrop field"));
         assert!(offsets.windows(2).all(|pair| pair[0] < pair[1]));
@@ -2264,6 +2334,10 @@ mod backdrop_blur_tests {
                 "SourceTexture",
             ),
             (BackdropBlurInputIndex::SourceRect as u32, "SourceRect"),
+            (
+                BackdropBlurInputIndex::SnapshotTexture as u32,
+                "SnapshotTexture",
+            ),
         ] {
             assert!(header.contains(&format!("BackdropBlurInputIndex_{name} = {index}")));
         }
@@ -2272,7 +2346,33 @@ mod backdrop_blur_tests {
 
     #[test]
     fn fade_shader_bindings_match_primitive_layouts() {
-        assert_eq!(mem::size_of::<EdgeFadeParams>(), 32);
+        assert_eq!(mem::size_of::<RoundedClipParams>(), 32);
+        assert_eq!(
+            [
+                mem::offset_of!(RoundedClipParams, left),
+                mem::offset_of!(RoundedClipParams, top),
+                mem::offset_of!(RoundedClipParams, right),
+                mem::offset_of!(RoundedClipParams, bottom),
+                mem::offset_of!(RoundedClipParams, top_left),
+                mem::offset_of!(RoundedClipParams, top_right),
+                mem::offset_of!(RoundedClipParams, bottom_right),
+                mem::offset_of!(RoundedClipParams, bottom_left),
+            ],
+            [0, 4, 8, 12, 16, 20, 24, 28]
+        );
+        assert_eq!(mem::size_of::<EdgeFadeParams>(), 64);
+        assert_eq!(mem::offset_of!(EdgeFadeParams, clip), 32);
+        assert_eq!(mem::size_of::<Shadow>(), 144);
+        assert_eq!(mem::offset_of!(Shadow, clip), 112);
+        assert_eq!(mem::size_of::<Underline>(), 96);
+        assert_eq!(mem::offset_of!(Underline, clip), 64);
+        assert_eq!(mem::size_of::<SurfaceBounds>(), 64);
+        assert_eq!(mem::offset_of!(SurfaceBounds, clip), 32);
+        assert_eq!(mem::size_of::<PathSprite>(), 48);
+        assert_eq!(mem::offset_of!(PathSprite, clip), 16);
+        assert_eq!(mem::size_of::<Quad>(), 224);
+        assert_eq!(mem::size_of::<MonochromeSprite>(), 176);
+        assert_eq!(mem::size_of::<PolychromeSprite>(), 160);
         assert_eq!(mem::offset_of!(Quad, fade), 160);
         assert_eq!(mem::offset_of!(MonochromeSprite, fade), 112);
         assert_eq!(mem::offset_of!(gpui::PolychromeSprite, fade), 96);
@@ -2354,9 +2454,46 @@ mod backdrop_blur_tests {
             "right_x",
             "band_left",
             "band_right",
+            "clip",
         ]
         .map(|field| definition.find(&format!(" {field};")).unwrap());
         assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+        let definition = header
+            .split("struct RoundedClipParams {")
+            .nth(1)
+            .expect("RoundedClipParams missing from generated Metal header")
+            .split('}')
+            .next()
+            .unwrap();
+        let positions = [
+            "left",
+            "top",
+            "right",
+            "bottom",
+            "top_left",
+            "top_right",
+            "bottom_right",
+            "bottom_left",
+        ]
+        .map(|field| definition.find(&format!(" {field};")).unwrap());
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+        for (name, preceding) in [
+            ("Shadow", "pad"),
+            ("Underline", "wavy"),
+            ("PathSprite", "bounds"),
+            ("SurfaceBounds", "content_mask"),
+        ] {
+            let definition = header
+                .split(&format!("struct {name} {{"))
+                .nth(1)
+                .unwrap()
+                .split('}')
+                .next()
+                .unwrap();
+            let preceding = definition.find(&format!(" {preceding};")).unwrap();
+            let clip = definition.find("RoundedClipParams clip;").unwrap();
+            assert!(preceding < clip, "{name}");
+        }
     }
 
     #[test]
@@ -2609,5 +2746,326 @@ mod backdrop_blur_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn rounded_clip_combines_with_fade_and_alpha_for_quads_glyphs_and_images() {
+        let mut renderer = renderer();
+        renderer.opaque = false;
+        let tile_size = size(DevicePixels(64), DevicePixels(64));
+        let glyph = renderer
+            .sprite_atlas()
+            .get_or_insert_with(
+                RenderGlyphParams {
+                    font_id: FontId(0),
+                    glyph_id: GlyphId(1),
+                    font_size: px(64.),
+                    subpixel_variant: point(0, 0),
+                    scale_factor: 1.,
+                    is_emoji: false,
+                    subpixel_rendering: false,
+                    dilation: 0,
+                }
+                .into(),
+                &mut || Ok(Some((tile_size, Cow::Owned(vec![255; 64 * 64])))),
+            )
+            .unwrap()
+            .unwrap();
+        let image = renderer
+            .sprite_atlas()
+            .get_or_insert_with(
+                RenderImageParams {
+                    image_id: ImageId(739),
+                    frame_index: 0,
+                }
+                .into(),
+                &mut || {
+                    Ok(Some((
+                        tile_size,
+                        Cow::Owned([255u8, 255, 255, 160].repeat(64 * 64)),
+                    )))
+                },
+            )
+            .unwrap()
+            .unwrap();
+
+        for kind in 0..4 {
+            let mut images = Vec::new();
+            for (clipped, faded) in [(false, false), (true, false), (true, true)] {
+                let fade = EdgeFadeParams {
+                    band_left: if faded { 32. } else { 0. },
+                    clip: if clipped {
+                        rounded_clip()
+                    } else {
+                        Default::default()
+                    },
+                    ..Default::default()
+                };
+                let mut scene = Scene::default();
+                match kind {
+                    0 | 3 => {
+                        let mut panel = quad(0, bounds(0., 0., 64., 64.), 0xffffff80);
+                        if kind == 3 {
+                            panel.border_color = rgba(0x00ff0080).into();
+                            panel.border_widths = Edges::all(ScaledPixels(16.));
+                        }
+                        panel.fade = fade;
+                        scene.quads.push(panel);
+                    }
+                    1 => scene.monochrome_sprites.push(MonochromeSprite {
+                        order: 0,
+                        pad: 0,
+                        tile: glyph,
+                        bounds: bounds(0., 0., 56., 56.),
+                        content_mask: ContentMask {
+                            bounds: bounds(0., 0., 64., 64.),
+                        },
+                        color: rgba(0xffffff80).into(),
+                        transformation: TransformationMatrix {
+                            translation: [8., 8.],
+                            ..TransformationMatrix::unit()
+                        },
+                        fade,
+                    }),
+                    _ => scene.polychrome_sprites.push(PolychromeSprite {
+                        order: 0,
+                        pad: 0,
+                        tile: image,
+                        grayscale: false.into(),
+                        opacity: 0.75,
+                        bounds: bounds(0., 0., 64., 64.),
+                        content_mask: ContentMask {
+                            bounds: bounds(0., 0., 64., 64.),
+                        },
+                        corner_radii: Corners::default(),
+                        fade,
+                    }),
+                }
+                images.push(render(&mut renderer, &mut scene, 64, 64));
+            }
+
+            assert!(images[0].get_pixel(8, 30)[3] > 100, "kind={kind}");
+            assert_eq!(images[1].get_pixel(8, 30)[3], 0, "kind={kind}");
+            assert_eq!(images[1].get_pixel(10, 10)[3], 0, "kind={kind}");
+            assert_eq!(images[1].get_pixel(49, 49)[3], 0, "kind={kind}");
+            for (x, y) in [(49, 10), (10, 49), (30, 30)] {
+                assert_eq!(
+                    images[1].get_pixel(x, y),
+                    images[0].get_pixel(x, y),
+                    "kind={kind}"
+                );
+            }
+            for (x, y, coverage) in [(13, 13, 0.479_184_72), (30, 30, 1.)] {
+                let fade = ((x as f32 + 0.5) / 32.).clamp(0., 1.).powi(2);
+                for channel in 0..4 {
+                    let baseline = images[0].get_pixel(x, y)[channel] as f32;
+                    let clipped = images[1].get_pixel(x, y)[channel] as f32;
+                    let faded = images[2].get_pixel(x, y)[channel] as f32;
+                    assert!(
+                        (clipped - baseline * coverage).abs() <= 2.,
+                        "kind={kind} channel={channel}"
+                    );
+                    assert!(
+                        (faded - baseline * coverage * fade).abs() <= 2.,
+                        "kind={kind} channel={channel}"
+                    );
+                }
+            }
+        }
+    }
+
+    fn solid_path(order: DrawOrder, color: u32, clip: RoundedClipParams) -> Path<ScaledPixels> {
+        let mut path = Path::new(point(px(0.), px(0.)));
+        path.push_triangle(
+            (
+                point(px(0.), px(0.)),
+                point(px(128.), px(0.)),
+                point(px(0.), px(128.)),
+            ),
+            (point(0., 1.), point(0., 1.), point(0., 1.)),
+        );
+        let mut path = path.scale(1.);
+        path.order = order;
+        path.content_mask = ContentMask {
+            bounds: bounds(0., 0., 64., 64.),
+        };
+        path.color = solid_background(rgba(color));
+        path.clip = clip;
+        path
+    }
+
+    #[test]
+    fn rounded_clip_applies_to_shadow_underlines_and_paths() {
+        let mut renderer = renderer();
+        renderer.opaque = false;
+        let viewport = bounds(0., 0., 64., 64.);
+        for kind in 0..5 {
+            let mut images = Vec::new();
+            for clipped in [false, true] {
+                let clip = if clipped {
+                    rounded_clip()
+                } else {
+                    Default::default()
+                };
+                let mut scene = Scene::default();
+                match kind {
+                    0 | 4 => scene.shadows.push(Shadow {
+                        order: 0,
+                        blur_radius: ScaledPixels(0.),
+                        bounds: if kind == 4 {
+                            bounds(100., 100., 1., 1.)
+                        } else {
+                            viewport
+                        },
+                        corner_radii: Corners::default(),
+                        content_mask: ContentMask { bounds: viewport },
+                        color: rgba(0xffffff80).into(),
+                        element_bounds: viewport,
+                        element_corner_radii: Corners::default(),
+                        inset: if kind == 4 { 1 } else { 0 },
+                        pad: 0,
+                        clip,
+                    }),
+                    1 | 3 => scene.underlines.push(Underline {
+                        order: 0,
+                        pad: 0,
+                        bounds: if kind == 3 {
+                            bounds(0., 12., 64., 4.)
+                        } else {
+                            viewport
+                        },
+                        content_mask: ContentMask { bounds: viewport },
+                        color: rgba(0xffffff80).into(),
+                        thickness: ScaledPixels(4.),
+                        wavy: (kind == 3).into(),
+                        clip,
+                    }),
+                    _ => scene.paths.push(solid_path(0, 0xffffff80, clip)),
+                }
+                images.push(render(&mut renderer, &mut scene, 64, 64));
+            }
+            assert!(images[0].get_pixel(13, 13)[3] > 100, "kind={kind}");
+            assert_eq!(images[1].get_pixel(10, 13)[3], 0, "kind={kind}");
+            assert_eq!(
+                images[1].get_pixel(49, 13),
+                images[0].get_pixel(49, 13),
+                "kind={kind}"
+            );
+            for channel in 0..4 {
+                let baseline = images[0].get_pixel(13, 13)[channel] as f32;
+                let clipped = images[1].get_pixel(13, 13)[channel] as f32;
+                assert!(
+                    (clipped - baseline * 0.479_184_72).abs() <= 3.,
+                    "kind={kind} channel={channel}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn path_clip_applies_once_after_overlapping_triangles_are_rasterized() {
+        let mut renderer = renderer();
+        renderer.opaque = false;
+        let mut images = Vec::new();
+        for clipped in [false, true] {
+            let mut path = Path::new(point(px(0.), px(0.)));
+            for _ in 0..2 {
+                path.push_triangle(
+                    (
+                        point(px(0.), px(0.)),
+                        point(px(128.), px(0.)),
+                        point(px(0.), px(128.)),
+                    ),
+                    (point(0., 1.), point(0., 1.), point(0., 1.)),
+                );
+            }
+            let mut path = path.scale(1.);
+            path.content_mask = ContentMask {
+                bounds: bounds(0., 0., 64., 64.),
+            };
+            path.color = solid_background(rgba(0xffffff80));
+            if clipped {
+                path.clip = rounded_clip();
+            }
+            let mut scene = Scene::default();
+            scene.paths.push(path);
+            images.push(render(&mut renderer, &mut scene, 64, 64));
+        }
+        let baseline = images[0].get_pixel(13, 13);
+        let clipped = images[1].get_pixel(13, 13);
+        assert!(
+            (188..=194).contains(&baseline[3]),
+            "overlapping triangles: {baseline:?}"
+        );
+        for channel in 0..4 {
+            assert!(
+                (clipped[channel] as f32 - baseline[channel] as f32 * 0.479_184_72).abs() <= 3.
+            );
+        }
+    }
+
+    #[test]
+    fn rounded_clip_preserves_path_and_foreground_order() {
+        let mut renderer = renderer();
+        renderer.opaque = false;
+        let mut scene = Scene::default();
+        scene.paths.push(solid_path(0, 0xff000080, rounded_clip()));
+        scene
+            .paths
+            .push(solid_path(1, 0x00ff0080, Default::default()));
+        scene
+            .quads
+            .push(quad(2, bounds(30., 30., 4., 4.), 0x0000ffff));
+        let image = render(&mut renderer, &mut scene, 64, 64);
+        let edge = image.get_pixel(13, 13);
+        assert!((28..=34).contains(&edge[0]), "clipped red path: {edge:?}");
+        assert!(
+            (126..=130).contains(&edge[1]),
+            "unclipped green path: {edge:?}"
+        );
+        assert!((156..=162).contains(&edge[3]), "composited alpha: {edge:?}");
+        assert_eq!(*image.get_pixel(30, 30), image::Rgba([0, 0, 255, 255]));
+    }
+
+    #[test]
+    fn rounded_backdrop_mixes_blur_with_unmodified_transparent_snapshot() {
+        let mut renderer = renderer();
+        renderer.opaque = false;
+        let mut images = Vec::new();
+        for (with_blur, clipped) in [(false, false), (true, false), (true, true)] {
+            let mut scene = Scene::default();
+            scene
+                .quads
+                .push(quad(0, bounds(0., 0., 14., 64.), 0xffffff80));
+            if with_blur {
+                let mut panel = blur(1, bounds(0., 0., 64., 64.), 4.);
+                if clipped {
+                    panel.clip = rounded_clip();
+                }
+                scene.backdrop_blurs.push(panel);
+            }
+            scene
+                .quads
+                .push(quad(2, bounds(30., 30., 4., 4.), 0xff0000ff));
+            images.push(render(&mut renderer, &mut scene, 64, 64));
+        }
+        assert_eq!(images[2].get_pixel(10, 10), images[0].get_pixel(10, 10));
+        let original = images[0].get_pixel(13, 13);
+        let blurred = images[1].get_pixel(13, 13);
+        let clipped = images[2].get_pixel(13, 13);
+        assert!(blurred[3] + 10 < original[3], "blur must affect the edge");
+        for channel in 0..4 {
+            let expected = original[channel] as f32 * (1. - 0.479_184_72)
+                + blurred[channel] as f32 * 0.479_184_72;
+            assert!(
+                (clipped[channel] as f32 - expected).abs() <= 3.,
+                "channel={channel}: {clipped:?}"
+            );
+        }
+        assert!(
+            clipped[0].abs_diff(clipped[3]) <= 2,
+            "premultiplied alpha: {clipped:?}"
+        );
+        assert_eq!(*images[2].get_pixel(30, 30), image::Rgba([255, 0, 0, 255]));
     }
 }

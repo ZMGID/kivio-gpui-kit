@@ -10,7 +10,7 @@ use bytemuck::{Pod, Zeroable};
 use collections::FxHashMap;
 use gpui::{
     AtlasTextureId, BackdropBlur, Background, Bounds, DevicePixels, GpuSpecs, Path, Point,
-    PrimitiveBatch, ScaledPixels, Scene, Size, get_gamma_correction_ratios,
+    PrimitiveBatch, RoundedClipParams, ScaledPixels, Scene, Size, get_gamma_correction_ratios,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -87,9 +87,38 @@ impl From<Bounds<ScaledPixels>> for PodBounds {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
+struct PodRoundedClip {
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+    top_left: f32,
+    top_right: f32,
+    bottom_right: f32,
+    bottom_left: f32,
+}
+
+impl From<RoundedClipParams> for PodRoundedClip {
+    fn from(clip: RoundedClipParams) -> Self {
+        Self {
+            left: clip.left,
+            top: clip.top,
+            right: clip.right,
+            bottom: clip.bottom,
+            top_left: clip.top_left,
+            top_right: clip.top_right,
+            bottom_right: clip.bottom_right,
+            bottom_left: clip.bottom_left,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
 struct SurfaceParams {
     bounds: PodBounds,
     content_mask: PodBounds,
+    clip: PodRoundedClip,
 }
 
 #[repr(C)]
@@ -120,6 +149,7 @@ struct BackdropBlurUniform {
     corner_radii: [f32; 4],
     clip_bounds: PodBounds,
     source_rect: [f32; 4],
+    clip: PodRoundedClip,
 }
 
 #[derive(Clone)]
@@ -146,6 +176,7 @@ const SCRATCH_RELEASE_AFTER_FRAMES: u32 = 30;
 #[repr(C)]
 struct PathSprite {
     bounds: Bounds<ScaledPixels>,
+    clip: RoundedClipParams,
 }
 
 #[derive(Clone, Debug)]
@@ -699,6 +730,16 @@ impl WgpuRendererCore {
                     binding: 2,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
                     count: None,
                 },
             ],
@@ -1713,21 +1754,29 @@ impl WgpuRendererCore {
                             continue;
                         }
 
-                        drop(pass);
-                        let rasterized = self.draw_paths_to_intermediate(
-                            &mut encoder,
-                            paths,
-                            &mut instance_offset,
-                        )?;
-
-                        pass = Self::continue_main_pass(&mut encoder, frame_view);
-
-                        if rasterized {
-                            self.draw_paths_from_intermediate(
-                                paths,
+                        // Resolve overlapping triangles before clipping each path once.
+                        let split = paths.iter().any(|path| path.clip.right > path.clip.left);
+                        let batch_count = if split { paths.len() } else { 1 };
+                        for index in 0..batch_count {
+                            let batch = if split {
+                                &paths[index..index + 1]
+                            } else {
+                                paths
+                            };
+                            drop(pass);
+                            let rasterized = self.draw_paths_to_intermediate(
+                                &mut encoder,
+                                batch,
                                 &mut instance_offset,
-                                &mut pass,
                             )?;
+                            pass = Self::continue_main_pass(&mut encoder, frame_view);
+                            if rasterized {
+                                self.draw_paths_from_intermediate(
+                                    batch,
+                                    &mut instance_offset,
+                                    &mut pass,
+                                )?;
+                            }
                         }
                     }
                     PrimitiveBatch::Underlines(range) => self.draw_instances(
@@ -1975,6 +2024,7 @@ impl WgpuRendererCore {
                 .iter()
                 .map(|p| PathSprite {
                     bounds: p.clipped_bounds(),
+                    clip: p.clip,
                 })
                 .collect()
         } else {
@@ -1982,7 +2032,10 @@ impl WgpuRendererCore {
             for path in paths.iter().skip(1) {
                 bounds = bounds.union(&path.clipped_bounds());
             }
-            vec![PathSprite { bounds }]
+            vec![PathSprite {
+                bounds,
+                clip: RoundedClipParams::default(),
+            }]
         };
 
         let Some(path_intermediate_view) = self.resources().path_intermediate_view.clone() else {
@@ -2947,8 +3000,8 @@ mod tests {
     }
 
     #[test]
-    fn backdrop_uniforms_match_wgsl_layout() {
-        for source in [STORAGE_BUFFER_SHADERS, WEBGL_SHADERS] {
+    fn shader_structs_match_host_layouts() {
+        for source in [STORAGE_BUFFER_SHADERS, WEBGL_SHADERS, SUBPIXEL_SHADERS] {
             let module = naga::front::wgsl::parse_str(source).unwrap();
             let layout = |name: &str| {
                 let ty = module
@@ -2968,6 +3021,144 @@ mod tests {
                     _ => panic!("{name} is not a struct"),
                 }
             };
+            macro_rules! check_layout {
+                ($name:literal, $ty:ty, $($field:ident),+ $(,)?) => {
+                    assert_eq!(
+                        layout($name),
+                        (
+                            vec![$(std::mem::offset_of!($ty, $field)),+],
+                            std::mem::size_of::<$ty>(),
+                        ),
+                        "{} layout for {}", $name, stringify!($ty),
+                    );
+                };
+            }
+            check_layout!(
+                "RoundedClipParams",
+                RoundedClipParams,
+                left,
+                top,
+                right,
+                bottom,
+                top_left,
+                top_right,
+                bottom_right,
+                bottom_left,
+            );
+            check_layout!(
+                "RoundedClipParams",
+                PodRoundedClip,
+                left,
+                top,
+                right,
+                bottom,
+                top_left,
+                top_right,
+                bottom_right,
+                bottom_left,
+            );
+            check_layout!(
+                "EdgeFadeParams",
+                gpui::EdgeFadeParams,
+                top_y,
+                bottom_y,
+                band_top,
+                band_bottom,
+                left_x,
+                right_x,
+                band_left,
+                band_right,
+                clip,
+            );
+            check_layout!(
+                "Quad",
+                Quad,
+                order,
+                border_style,
+                bounds,
+                content_mask,
+                background,
+                border_color,
+                corner_radii,
+                border_widths,
+                fade,
+            );
+            check_layout!(
+                "Shadow",
+                Shadow,
+                order,
+                blur_radius,
+                bounds,
+                corner_radii,
+                content_mask,
+                color,
+                element_bounds,
+                element_corner_radii,
+                inset,
+                pad,
+                clip,
+            );
+            check_layout!(
+                "PathRasterizationVertex",
+                PathRasterizationVertex,
+                xy_position,
+                st_position,
+                color,
+                bounds,
+            );
+            check_layout!("PathSprite", PathSprite, bounds, clip);
+            check_layout!(
+                "Underline",
+                Underline,
+                order,
+                pad,
+                bounds,
+                content_mask,
+                color,
+                thickness,
+                wavy,
+                clip,
+            );
+            check_layout!(
+                "MonochromeSprite",
+                MonochromeSprite,
+                order,
+                pad,
+                tile,
+                bounds,
+                content_mask,
+                color,
+                transformation,
+                fade,
+            );
+            if source == SUBPIXEL_SHADERS {
+                check_layout!(
+                    "SubpixelSprite",
+                    SubpixelSprite,
+                    order,
+                    pad,
+                    tile,
+                    bounds,
+                    content_mask,
+                    color,
+                    transformation,
+                    fade,
+                );
+            }
+            check_layout!(
+                "PolychromeSprite",
+                PolychromeSprite,
+                order,
+                pad,
+                tile,
+                grayscale,
+                opacity,
+                bounds,
+                content_mask,
+                corner_radii,
+                fade,
+            );
+            check_layout!("SurfaceParams", SurfaceParams, bounds, content_mask, clip);
             assert_eq!(
                 layout("BlurPassParams"),
                 (
@@ -2990,6 +3181,7 @@ mod tests {
                         std::mem::offset_of!(BackdropBlurUniform, corner_radii),
                         std::mem::offset_of!(BackdropBlurUniform, clip_bounds),
                         std::mem::offset_of!(BackdropBlurUniform, source_rect),
+                        std::mem::offset_of!(BackdropBlurUniform, clip),
                     ],
                     std::mem::size_of::<BackdropBlurUniform>(),
                 )
@@ -3026,14 +3218,14 @@ mod tests {
 
     #[test]
     fn webgl_record_sizes_match_shader_word_strides() {
-        assert_eq!(std::mem::size_of::<Quad>(), 48 * 4);
-        assert_eq!(std::mem::size_of::<Shadow>(), 28 * 4);
+        assert_eq!(std::mem::size_of::<Quad>(), 56 * 4);
+        assert_eq!(std::mem::size_of::<Shadow>(), 36 * 4);
         assert_eq!(std::mem::size_of::<PathRasterizationVertex>(), 26 * 4);
-        assert_eq!(std::mem::size_of::<PathSprite>(), 4 * 4);
-        assert_eq!(std::mem::size_of::<Underline>(), 16 * 4);
-        assert_eq!(std::mem::size_of::<MonochromeSprite>(), 36 * 4);
-        assert_eq!(std::mem::size_of::<SubpixelSprite>(), 36 * 4);
-        assert_eq!(std::mem::size_of::<PolychromeSprite>(), 32 * 4);
+        assert_eq!(std::mem::size_of::<PathSprite>(), 12 * 4);
+        assert_eq!(std::mem::size_of::<Underline>(), 24 * 4);
+        assert_eq!(std::mem::size_of::<MonochromeSprite>(), 44 * 4);
+        assert_eq!(std::mem::size_of::<SubpixelSprite>(), 44 * 4);
+        assert_eq!(std::mem::size_of::<PolychromeSprite>(), 40 * 4);
     }
 
     #[test]
@@ -3112,6 +3304,16 @@ mod tests {
                 right_x: 39.0,
                 band_left: 40.0,
                 band_right: 41.0,
+                clip: RoundedClipParams {
+                    left: 42.0,
+                    top: 43.0,
+                    right: 44.0,
+                    bottom: 45.0,
+                    top_left: 46.0,
+                    top_right: 47.0,
+                    bottom_right: 48.0,
+                    bottom_left: 49.0,
+                },
             },
         };
 
@@ -3168,11 +3370,19 @@ mod tests {
                 39.0_f32.to_bits(),
                 40.0_f32.to_bits(),
                 41.0_f32.to_bits(),
+                42.0_f32.to_bits(),
+                43.0_f32.to_bits(),
+                44.0_f32.to_bits(),
+                45.0_f32.to_bits(),
+                46.0_f32.to_bits(),
+                47.0_f32.to_bits(),
+                48.0_f32.to_bits(),
+                49.0_f32.to_bits(),
             ]
         );
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, not(target_family = "wasm")))]
 #[path = "backdrop_tests.rs"]
 mod backdrop_tests;

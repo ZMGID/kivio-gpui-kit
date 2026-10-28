@@ -14,6 +14,8 @@ mod index_path;
 mod inspector;
 mod overlay_backdrop;
 mod root;
+#[cfg(not(feature = "gpui-fast"))]
+mod rounded_clip;
 mod sizing;
 mod styled;
 mod time;
@@ -116,6 +118,8 @@ pub use resizable::{
     ResizablePanel, ResizablePanelEvent, ResizablePanelGroup, ResizableState, h_resizable,
     resizable_panel, resize_handle, resize_handle_appearance, v_resizable,
 };
+#[cfg(not(feature = "gpui-fast"))]
+pub use rounded_clip::{RoundedClip, rounded_clip};
 pub use styled::*;
 pub use theme::*;
 pub use time::{calendar, date_picker, time_field};

@@ -741,7 +741,7 @@ impl Styled for AttachmentMedia {
 }
 
 impl RenderOnce for AttachmentMedia {
-    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let tokens = cx.theme().semantic_tokens();
         let resolved_size = self.size.unwrap_or_default();
         let metrics = card_metrics(resolved_size);
@@ -769,6 +769,7 @@ impl RenderOnce for AttachmentMedia {
         let source = self.source;
         let has_source = source.is_some();
         let failed_media = status.is_failed() && !has_source;
+        #[cfg(feature = "gpui-fast")]
         let corner_radii = self.style.corner_radii.clone();
         let ring_id: ElementId = match self.id {
             Some(id) => (id, "progress").into(),
@@ -822,7 +823,7 @@ impl RenderOnce for AttachmentMedia {
             None
         };
 
-        div()
+        let mut surface = div()
             .relative()
             .flex()
             .flex_shrink_0()
@@ -849,16 +850,17 @@ impl RenderOnce for AttachmentMedia {
                 tokens.colors.foreground
             })
             .when_some(source, |this, source| {
-                // gpui clips rectangularly, so the slot's `overflow_hidden` cannot
-                // round the image: it carries the slot's radius itself, including
-                // a caller's `.rounded()` refinement.
-                let mut image = img(source)
+                let image = img(source)
                     .absolute()
                     .inset_0()
                     .size_full()
-                    .rounded(radius)
                     .object_fit(ObjectFit::Cover);
-                image.style().corner_radii.refine(&corner_radii);
+                #[cfg(feature = "gpui-fast")]
+                let image = {
+                    let mut image = image.rounded(radius);
+                    image.style().corner_radii.refine(&corner_radii);
+                    image
+                };
                 this.child(image)
             })
             .map(|this| match glyph {
@@ -866,22 +868,36 @@ impl RenderOnce for AttachmentMedia {
                 None => this.children(self.children),
             })
             .when_some(scrim, |this, (opacity, control)| {
-                // The scrim is clipped rectangularly like the image, so it
-                // rounds itself the same way, refinement included.
-                let mut scrim = div()
+                let scrim = div()
                     .absolute()
                     .inset_0()
                     .flex()
                     .items_center()
                     .justify_center()
-                    .rounded(radius)
                     .bg(black().opacity(opacity))
                     .child(control);
-                scrim.style().corner_radii.refine(&corner_radii);
+                #[cfg(feature = "gpui-fast")]
+                let scrim = {
+                    let mut scrim = scrim.rounded(radius);
+                    scrim.style().corner_radii.refine(&corner_radii);
+                    scrim
+                };
                 this.child(scrim)
             })
             .children(self.overlays)
-            .refine_style(&self.style)
+            .refine_style(&self.style);
+        #[cfg(not(feature = "gpui-fast"))]
+        {
+            let corners = crate::styled::corner_radii(surface.style(), window.rem_size());
+            // The clip owns antialiasing; do not multiply it by the same rounded fill.
+            surface.style().corner_radii = Default::default();
+            crate::rounded_clip(corners, surface).into_any_element()
+        }
+        #[cfg(feature = "gpui-fast")]
+        {
+            let _ = (&mut surface, window);
+            surface.into_any_element()
+        }
     }
 }
 

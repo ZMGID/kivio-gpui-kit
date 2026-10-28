@@ -607,7 +607,25 @@ impl PrimitiveBatch {
     }
 }
 
-/// Device-pixel edge fade parameters carried by individual scene primitives.
+/// A rounded clip in device pixels. A zero-width clip disables the effect.
+///
+/// Adapted from zui `crates/gpui/src/scene.rs` at
+/// b564a34413bb7ef1da04121c4a287758f94993d9 (Apache-2.0).
+#[derive(Default, Debug, Copy, Clone, PartialEq)]
+#[repr(C)]
+#[expect(missing_docs)]
+pub struct RoundedClipParams {
+    pub left: f32,
+    pub top: f32,
+    pub right: f32,
+    pub bottom: f32,
+    pub top_left: f32,
+    pub top_right: f32,
+    pub bottom_right: f32,
+    pub bottom_left: f32,
+}
+
+/// Device-pixel edge fade and rounded clip carried by scene primitives.
 /// A zero band disables that edge; a zeroed value leaves opacity unchanged.
 #[derive(Default, Debug, Copy, Clone, PartialEq)]
 #[repr(C)]
@@ -621,6 +639,7 @@ pub struct EdgeFadeParams {
     pub right_x: f32,
     pub band_left: f32,
     pub band_right: f32,
+    pub clip: RoundedClipParams,
 }
 
 #[derive(Default, Debug, Copy, Clone)]
@@ -655,6 +674,7 @@ pub struct Underline {
     pub color: Hsla,
     pub thickness: ScaledPixels,
     pub wavy: PaddedBool32,
+    pub clip: RoundedClipParams,
 }
 
 impl From<Underline> for Primitive {
@@ -672,6 +692,7 @@ pub struct BackdropBlur {
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
     pub corner_radii: Corners<ScaledPixels>,
+    pub clip: RoundedClipParams,
 }
 
 impl BackdropBlur {
@@ -720,6 +741,7 @@ pub struct Shadow {
     /// 0 = drop shadow (rendered outside the element), 1 = inset shadow (rendered inside).
     pub inset: u32,
     pub pad: u32, // align to 8 bytes
+    pub clip: RoundedClipParams,
 }
 
 impl From<Shadow> for Primitive {
@@ -909,6 +931,7 @@ pub struct PaintSurface {
     pub order: DrawOrder,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
+    pub clip: RoundedClipParams,
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub image_buffer: objc2_core_foundation::CFRetained<objc2_core_video::CVPixelBuffer>,
 }
@@ -933,6 +956,8 @@ pub struct Path<P: Clone + Debug + Default + PartialEq> {
     pub content_mask: ContentMask<P>,
     pub vertices: Vec<PathVertex<P>>,
     pub color: Background,
+    /// Rounded clip in device pixels, attached when the path is painted.
+    pub clip: RoundedClipParams,
     start: Point<P>,
     current: Point<P>,
     contour_count: usize,
@@ -953,6 +978,7 @@ impl Path<Pixels> {
             },
             content_mask: Default::default(),
             color: Default::default(),
+            clip: RoundedClipParams::default(),
             contour_count: 0,
         }
     }
@@ -973,6 +999,7 @@ impl Path<Pixels> {
             current: self.current.scale(factor),
             contour_count: self.contour_count,
             color: self.color,
+            clip: self.clip,
         }
     }
 

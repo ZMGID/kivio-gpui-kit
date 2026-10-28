@@ -394,11 +394,7 @@ impl DirectXRenderer {
             match batch {
                 PrimitiveBatch::Shadows(range) => self.draw_shadows(range.start, range.len()),
                 PrimitiveBatch::Quads(range) => self.draw_quads(range.start, range.len()),
-                PrimitiveBatch::Paths(range) => {
-                    let paths = &scene.paths[range];
-                    self.draw_paths_to_intermediate(paths)?;
-                    self.draw_paths_from_intermediate(paths)
-                }
+                PrimitiveBatch::Paths(range) => self.draw_paths(&scene.paths[range]),
                 PrimitiveBatch::Underlines(range) => self.draw_underlines(range.start, range.len()),
                 PrimitiveBatch::MonochromeSprites { texture_id, range } => {
                     self.draw_monochrome_sprites(texture_id, range.start, range.len())
@@ -641,7 +637,31 @@ impl DirectXRenderer {
         )
     }
 
-    fn draw_paths_to_intermediate(&mut self, paths: &[Path<ScaledPixels>]) -> Result<()> {
+    fn draw_paths(&mut self, paths: &[Path<ScaledPixels>]) -> Result<()> {
+        let mut vertices = Vec::new();
+        let mut sprites = Vec::new();
+        let mut start = 0;
+        while start < paths.len() {
+            let mut end = start + 1;
+            if paths[start].clip.right <= paths[start].clip.left {
+                while end < paths.len() && paths[end].clip.right <= paths[end].clip.left {
+                    end += 1;
+                }
+            }
+            // A clipped path needs its own resolved image so coverage is applied
+            // once, after its triangles and before the next path is composited.
+            self.draw_paths_to_intermediate(&paths[start..end], &mut vertices)?;
+            self.draw_paths_from_intermediate(&paths[start..end], &mut sprites)?;
+            start = end;
+        }
+        Ok(())
+    }
+
+    fn draw_paths_to_intermediate(
+        &mut self,
+        paths: &[Path<ScaledPixels>],
+        vertices: &mut Vec<PathRasterizationSprite>,
+    ) -> Result<()> {
         if paths.is_empty() {
             return Ok(());
         }
@@ -650,6 +670,12 @@ impl DirectXRenderer {
         let resources = self.resources.as_ref().context("resources missing")?;
         // Clear intermediate MSAA texture
         unsafe {
+            devices
+                .device_context
+                .VSSetShaderResources(0, Some(&[None]));
+            devices
+                .device_context
+                .PSSetShaderResources(0, Some(&[None]));
             devices.device_context.ClearRenderTargetView(
                 resources.path_intermediate_msaa_view.as_ref().unwrap(),
                 &[0.0; 4],
@@ -661,8 +687,8 @@ impl DirectXRenderer {
             );
         }
 
-        // Collect all vertices and sprites for a single draw call
-        let mut vertices = Vec::new();
+        // Reuse scratch storage when clipped paths require separate draws.
+        vertices.clear();
 
         for path in paths {
             vertices.extend(path.vertices.iter().map(|v| PathRasterizationSprite {
@@ -676,7 +702,7 @@ impl DirectXRenderer {
         self.pipelines.path_rasterization_pipeline.update_buffer(
             &devices.device,
             &devices.device_context,
-            &vertices,
+            vertices.as_slice(),
         )?;
 
         self.pipelines.path_rasterization_pipeline.draw(
@@ -704,7 +730,11 @@ impl DirectXRenderer {
         Ok(())
     }
 
-    fn draw_paths_from_intermediate(&mut self, paths: &[Path<ScaledPixels>]) -> Result<()> {
+    fn draw_paths_from_intermediate(
+        &mut self,
+        paths: &[Path<ScaledPixels>],
+        sprites: &mut Vec<PathSprite>,
+    ) -> Result<()> {
         let Some(first_path) = paths.first() else {
             return Ok(());
         };
@@ -716,27 +746,29 @@ impl DirectXRenderer {
         // disjoint, so we can copy each path's bounds individually. If this
         // batch combines different draw orders, we perform a single copy
         // for a minimal spanning rect.
-        let sprites = if paths.last().unwrap().order == first_path.order {
-            paths
-                .iter()
-                .map(|path| PathSprite {
-                    bounds: path.clipped_bounds(),
-                })
-                .collect::<Vec<_>>()
+        sprites.clear();
+        if paths.last().unwrap().order == first_path.order {
+            sprites.extend(paths.iter().map(|path| PathSprite {
+                bounds: path.clipped_bounds(),
+                clip: path.clip,
+            }));
         } else {
             let mut bounds = first_path.clipped_bounds();
             for path in paths.iter().skip(1) {
                 bounds = bounds.union(&path.clipped_bounds());
             }
-            vec![PathSprite { bounds }]
-        };
+            sprites.push(PathSprite {
+                bounds,
+                clip: RoundedClipParams::default(),
+            });
+        }
 
         let devices = self.devices.as_ref().context("devices missing")?;
         let resources = self.resources.as_ref().context("resources missing")?;
         self.pipelines.path_sprite_pipeline.update_buffer(
             &devices.device,
             &devices.device_context,
-            &sprites,
+            sprites.as_slice(),
         )?;
 
         // Draw the sprites with the path texture
@@ -1309,6 +1341,7 @@ struct PathRasterizationSprite {
 #[repr(C)]
 struct PathSprite {
     bounds: Bounds<ScaledPixels>,
+    clip: RoundedClipParams,
 }
 
 impl Drop for DirectXRenderer {

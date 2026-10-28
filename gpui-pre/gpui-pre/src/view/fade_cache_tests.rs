@@ -234,6 +234,255 @@ fn exercise_fade_cache(cx: &mut TestAppContext, prepaint_scope: bool) {
     assert_eq!(renders.get(), initial_renders + 3);
 }
 
+struct ClipElement {
+    child: AnyElement,
+    radii: Option<crate::Corners<Pixels>>,
+    prepaint_scope: bool,
+    outer: Option<Bounds<Pixels>>,
+}
+
+impl IntoElement for ClipElement {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for ClipElement {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, ()) {
+        (self.child.request_layout(window, cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if let Some(radii) = self.radii.filter(|_| self.prepaint_scope) {
+            window.with_rounded_clip(bounds, radii, |window| self.child.prepaint(window, cx));
+        } else {
+            self.child.prepaint(window, cx);
+        }
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut (),
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let radii = self.radii;
+        let outer = self.outer;
+        let mut paint = |window: &mut Window| {
+            if let Some(radii) = radii {
+                window.with_rounded_clip(bounds, radii, |window| self.child.paint(window, cx));
+            } else {
+                self.child.paint(window, cx);
+            }
+        };
+        if let Some(outer) = outer {
+            window.with_rounded_clip(outer, px(6.), paint);
+        } else {
+            paint(window);
+        }
+    }
+}
+
+struct ClipRoot {
+    child: Entity<CachedChild>,
+    radii: Rc<Cell<Option<crate::Corners<Pixels>>>>,
+    prepaint_scope: bool,
+}
+
+impl Render for ClipRoot {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        ClipElement {
+            child: self
+                .child
+                .clone()
+                .cached(StyleRefinement::default().size(px(100.)))
+                .into_any_element(),
+            radii: self.radii.get(),
+            prepaint_scope: self.prepaint_scope,
+            outer: None,
+        }
+    }
+}
+
+#[gpui::test]
+fn cached_child_updates_when_prepaint_or_paint_only_clip_changes(cx: &mut TestAppContext) {
+    for prepaint_scope in [false, true] {
+        let radii = Rc::new(Cell::new(None));
+        let renders = Rc::new(Cell::new(0));
+        let window = cx.add_window({
+            let radii = radii.clone();
+            let renders = renders.clone();
+            move |_, cx| ClipRoot {
+                child: cx.new(|_| CachedChild { renders }),
+                radii,
+                prepaint_scope,
+            }
+        });
+        let draw = |cx: &mut TestAppContext| {
+            cx.update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                let scale = window.scale_factor();
+                let clip = window
+                    .painted_quads()
+                    .iter()
+                    .find(|quad| quad.bounds.size.width.0 > 75. * scale)
+                    .unwrap()
+                    .fade
+                    .clip;
+                (clip, scale)
+            })
+            .unwrap()
+        };
+
+        let (unclipped, _) = draw(cx);
+        assert_eq!(unclipped, crate::RoundedClipParams::default());
+        let initial = renders.get();
+        draw(cx);
+        assert_eq!(renders.get(), initial);
+
+        radii.set(Some(crate::Corners {
+            top_left: px(16.),
+            top_right: px(8.),
+            bottom_right: px(0.),
+            bottom_left: px(4.),
+        }));
+        let (clip, scale) = draw(cx);
+        assert_eq!(clip.top_left, 16. * scale);
+        assert_eq!(clip.top_right, 8. * scale);
+        assert_eq!(clip.bottom_right, 0.);
+        assert_eq!(clip.bottom_left, 4. * scale);
+        assert_eq!(renders.get(), initial + 1);
+        draw(cx);
+        assert_eq!(
+            renders.get(),
+            initial + 1,
+            "unchanged clip should reuse the view"
+        );
+
+        radii.set(Some(crate::Corners::all(px(24.))));
+        let (clip, scale) = draw(cx);
+        assert_eq!(clip.top_left, 24. * scale);
+        assert_eq!(clip.bottom_right, 24. * scale);
+        assert_eq!(
+            renders.get(),
+            initial + 2,
+            "same bounds but new radii must repaint"
+        );
+
+        radii.set(None);
+        let (clip, _) = draw(cx);
+        assert_eq!(clip, crate::RoundedClipParams::default());
+        assert_eq!(renders.get(), initial + 3);
+    }
+}
+
+struct NestedClipRoot {
+    child: Entity<CachedChild>,
+    outer: Rc<Cell<Bounds<Pixels>>>,
+}
+
+impl Render for NestedClipRoot {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        ClipElement {
+            child: self
+                .child
+                .clone()
+                .cached(StyleRefinement::default().size(px(100.)))
+                .into_any_element(),
+            radii: Some(crate::Corners::all(px(16.))),
+            prepaint_scope: false,
+            outer: Some(self.outer.get()),
+        }
+    }
+}
+
+#[gpui::test]
+fn cached_child_updates_when_outer_paint_only_clip_changes(cx: &mut TestAppContext) {
+    let full = Bounds::new(point(px(0.), px(0.)), size(px(100.), px(100.)));
+    let narrow = Bounds::new(point(px(20.), px(0.)), size(px(40.), px(100.)));
+    let empty = Bounds::new(point(px(10.), px(0.)), size(px(0.), px(100.)));
+    let outer = Rc::new(Cell::new(full));
+    let renders = Rc::new(Cell::new(0));
+    let window = cx.add_window({
+        let outer = outer.clone();
+        let renders = renders.clone();
+        move |_, cx| NestedClipRoot {
+            child: cx.new(|_| CachedChild { renders }),
+            outer,
+        }
+    });
+    let draw = |cx: &mut TestAppContext| {
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            let scale = window.scale_factor();
+            let quad = window
+                .painted_quads()
+                .into_iter()
+                .find(|quad| quad.bounds.size.width.0 > 75. * scale);
+            (quad, scale)
+        })
+        .unwrap()
+    };
+
+    let (quad, scale) = draw(cx);
+    let first = quad.unwrap();
+    assert_eq!(first.content_mask.bounds.size.width.0, 100. * scale);
+    assert_eq!(first.fade.clip.top_left, 16. * scale);
+    let initial = renders.get();
+    draw(cx);
+    assert_eq!(renders.get(), initial);
+
+    outer.set(narrow);
+    let (quad, scale) = draw(cx);
+    let narrowed = quad.unwrap();
+    assert_eq!(narrowed.content_mask.bounds.origin.x.0, 20. * scale);
+    assert_eq!(narrowed.content_mask.bounds.size.width.0, 40. * scale);
+    assert_eq!(narrowed.fade.clip, first.fade.clip);
+    assert_eq!(renders.get(), initial + 1);
+    draw(cx);
+    assert_eq!(renders.get(), initial + 1);
+
+    outer.set(empty);
+    assert!(draw(cx).0.is_none(), "an empty outer clip must hide the cached child");
+    assert_eq!(renders.get(), initial + 2);
+
+    outer.set(full);
+    let (quad, _) = draw(cx);
+    assert_eq!(quad.unwrap().content_mask, first.content_mask);
+    assert_eq!(renders.get(), initial + 3);
+}
+
 #[cfg(feature = "profiler")]
 type PhaseSamples = Rc<std::cell::RefCell<[Vec<std::time::Duration>; 3]>>;
 

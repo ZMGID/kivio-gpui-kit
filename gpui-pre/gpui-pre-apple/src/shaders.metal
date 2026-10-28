@@ -35,6 +35,23 @@ float blur_along_x(float x, float y, float sigma, float corner,
 float4 over(float4 below, float4 above);
 float radians(float degrees);
 
+// Rounded-rectangle SDF adapted from zui `crates/gpui_macos/src/shaders.metal`
+// at b564a34413bb7ef1da04121c4a287758f94993d9 (Apache-2.0).
+float rounded_clip_alpha(float2 position, RoundedClipParams clip) {
+  if (clip.right <= clip.left) {
+    return 1.0;
+  }
+  float2 half_size = float2(clip.right - clip.left, clip.bottom - clip.top) * 0.5;
+  float2 center = float2(clip.left, clip.top) + half_size;
+  float2 center_to_point = position - center;
+  float radius = center_to_point.x < 0.0
+    ? (center_to_point.y < 0.0 ? clip.top_left : clip.bottom_left)
+    : (center_to_point.y < 0.0 ? clip.top_right : clip.bottom_right);
+  float2 q = abs(center_to_point) - half_size + radius;
+  float distance = length(max(q, float2(0.0))) + min(max(q.x, q.y), 0.0) - radius;
+  return saturate(0.5 - distance);
+}
+
 float edge_fade_alpha(float2 position, EdgeFadeParams fade) {
   float ramp = 1.0;
   if (fade.band_top > 0.0) {
@@ -49,7 +66,7 @@ float edge_fade_alpha(float2 position, EdgeFadeParams fade) {
   if (fade.band_right > 0.0) {
     ramp = min(ramp, clamp((fade.right_x - position.x) / fade.band_right, 0.0, 1.0));
   }
-  return ramp * ramp;
+  return ramp * ramp * rounded_clip_alpha(position, fade.clip);
 }
 
 float4 fill_color(Background background, float2 position, Bounds_ScaledPixels bounds,
@@ -570,7 +587,7 @@ fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
     alpha *= saturate(0.5 - element_distance);
   }
 
-  return input.color * float4(1., 1., 1., alpha);
+  return input.color * float4(1., 1., 1., alpha * rounded_clip_alpha(input.position.xy, shadow.clip));
 }
 
 struct UnderlineVertexOutput {
@@ -613,6 +630,7 @@ fragment float4 underline_fragment(UnderlineFragmentInput input [[stage_in]],
   const float WAVE_HEIGHT_RATIO = 0.8;
 
   Underline underline = underlines[input.underline_id];
+  float clip_alpha = rounded_clip_alpha(input.position.xy, underline.clip);
   if (underline.wavy) {
     float half_thickness = underline.thickness * 0.5;
     float2 origin =
@@ -631,9 +649,9 @@ fragment float4 underline_fragment(UnderlineFragmentInput input [[stage_in]],
     float distance_from_bottom_border = distance_in_pixels + half_thickness;
     float alpha = saturate(
         0.5 - max(-distance_from_bottom_border, distance_from_top_border));
-    return input.color * float4(1., 1., 1., alpha);
+    return input.color * float4(1., 1., 1., alpha * clip_alpha);
   } else {
-    return input.color;
+    return input.color * float4(1., 1., 1., clip_alpha);
   }
 }
 
@@ -836,6 +854,7 @@ fragment float4 path_rasterization_fragment(
 struct PathSpriteVertexOutput {
   float4 position [[position]];
   float2 texture_coords;
+  uint sprite_id [[flat]];
 };
 
 vertex PathSpriteVertexOutput path_sprite_vertex(
@@ -857,27 +876,32 @@ vertex PathSpriteVertexOutput path_sprite_vertex(
 
   return PathSpriteVertexOutput{
     device_position,
-    texture_coords
+    texture_coords,
+    sprite_id
   };
 }
 
 fragment float4 path_sprite_fragment(
   PathSpriteVertexOutput input [[stage_in]],
+  constant PathSprite *sprites [[buffer(SpriteInputIndex_Sprites)]],
   texture2d<float> intermediate_texture [[texture(SpriteInputIndex_AtlasTexture)]]
 ) {
   constexpr sampler intermediate_texture_sampler(mag_filter::linear, min_filter::linear);
-  return intermediate_texture.sample(intermediate_texture_sampler, input.texture_coords);
+  return intermediate_texture.sample(intermediate_texture_sampler, input.texture_coords) *
+    rounded_clip_alpha(input.position.xy, sprites[input.sprite_id].clip);
 }
 
 struct SurfaceVertexOutput {
   float4 position [[position]];
   float2 texture_position;
+  uint surface_id [[flat]];
   float clip_distance [[clip_distance]][4];
 };
 
 struct SurfaceFragmentInput {
   float4 position [[position]];
   float2 texture_position;
+  uint surface_id [[flat]];
 };
 
 vertex SurfaceVertexOutput surface_vertex(
@@ -900,10 +924,13 @@ vertex SurfaceVertexOutput surface_vertex(
   return SurfaceVertexOutput{
       device_position,
       texture_position,
+      surface_id,
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
 }
 
 fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
+                                 constant SurfaceBounds *surfaces
+                                 [[buffer(SurfaceInputIndex_Surfaces)]],
                                  texture2d<float> y_texture
                                  [[texture(SurfaceInputIndex_YTexture)]],
                                  texture2d<float> cb_cr_texture
@@ -918,7 +945,9 @@ fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
       y_texture.sample(texture_sampler, input.texture_position).r,
       cb_cr_texture.sample(texture_sampler, input.texture_position).rg, 1.0);
 
-  return ycbcrToRGBTransform * ycbcr;
+  float4 color = ycbcrToRGBTransform * ycbcr;
+  color.a *= rounded_clip_alpha(input.position.xy, surfaces[input.surface_id].clip);
+  return color;
 }
 
 float4 hsla_to_rgba(Hsla hsla) {
@@ -1334,7 +1363,9 @@ fragment float4 backdrop_blur_fragment(
     constant BackdropBlur *blurs [[buffer(BackdropBlurInputIndex_Blurs)]],
     constant float4 &source_rect [[buffer(BackdropBlurInputIndex_SourceRect)]],
     texture2d<float> source_texture
-    [[texture(BackdropBlurInputIndex_SourceTexture)]]) {
+    [[texture(BackdropBlurInputIndex_SourceTexture)]],
+    texture2d<float> snapshot_texture
+    [[texture(BackdropBlurInputIndex_SnapshotTexture)]]) {
   constexpr sampler source_sampler(coord::normalized, address::clamp_to_edge,
                                    filter::linear);
   BackdropBlur blur = blurs[input.blur_id];
@@ -1343,5 +1374,10 @@ fragment float4 backdrop_blur_fragment(
     discard_fragment();
   }
   float2 uv = (input.position.xy - source_rect.xy) / source_rect.zw;
-  return source_texture.sample(source_sampler, uv);
+  float4 blurred = source_texture.sample(source_sampler, uv);
+  float clip_alpha = rounded_clip_alpha(input.position.xy, blur.clip);
+  if (clip_alpha >= 1.0) {
+    return blurred;
+  }
+  return mix(snapshot_texture.sample(source_sampler, uv), blurred, clip_alpha);
 }

@@ -516,6 +516,32 @@ fn gradient_color(background: Background, position: vec2<f32>, bounds: Bounds,
 
 // --- quads --- //
 
+// Rounded-rectangle SDF adapted from zui crates/gpui_wgpu/src/shaders.wgsl
+// at b564a34413bb7ef1da04121c4a287758f94993d9 (Apache-2.0).
+struct RoundedClipParams {
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+    top_left: f32,
+    top_right: f32,
+    bottom_right: f32,
+    bottom_left: f32,
+}
+
+fn rounded_clip_alpha(position: vec2<f32>, clip: RoundedClipParams) -> f32 {
+    if (clip.right <= clip.left) {
+        return 1.0;
+    }
+    let half_size = vec2<f32>(clip.right - clip.left, clip.bottom - clip.top) * 0.5;
+    let center = vec2<f32>(clip.left, clip.top) + half_size;
+    let radii = Corners(clip.top_left, clip.top_right, clip.bottom_right, clip.bottom_left);
+    let radius = min(pick_corner_radius(position - center, radii), min(half_size.x, half_size.y));
+    let q = abs(position - center) - half_size + vec2<f32>(radius);
+    let distance = length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - radius;
+    return clamp(0.5 - distance, 0.0, 1.0);
+}
+
 struct EdgeFadeParams {
     top_y: f32,
     bottom_y: f32,
@@ -525,6 +551,7 @@ struct EdgeFadeParams {
     right_x: f32,
     band_left: f32,
     band_right: f32,
+    clip: RoundedClipParams,
 }
 
 fn edge_fade_alpha(position: vec2<f32>, fade: EdgeFadeParams) -> f32 {
@@ -541,7 +568,7 @@ fn edge_fade_alpha(position: vec2<f32>, fade: EdgeFadeParams) -> f32 {
     if (fade.band_right > 0.0) {
         ramp = min(ramp, clamp((fade.right_x - position.x) / fade.band_right, 0.0, 1.0));
     }
-    return ramp * ramp;
+    return ramp * ramp * rounded_clip_alpha(position, fade.clip);
 }
 
 struct Quad {
@@ -992,6 +1019,7 @@ struct Shadow {
     // 0 = drop shadow, 1 = inset shadow.
     inset: u32,
     pad: u32, // align to 8 bytes
+    clip: RoundedClipParams,
 }
 
 struct ShadowVarying {
@@ -1072,7 +1100,7 @@ fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
         alpha *= saturate(0.5 - element_distance);
     }
 
-    return blend_color(input.color, alpha);
+    return blend_color(input.color, alpha * rounded_clip_alpha(input.position.xy, shadow.clip));
 }
 
 // --- path rasterization --- //
@@ -1143,12 +1171,14 @@ fn fs_path_rasterization(input: PathRasterizationVarying) -> @location(0) vec4<f
 
 struct PathSprite {
     bounds: Bounds,
+    clip: RoundedClipParams,
 }
 
 
 struct PathVarying {
     @builtin(position) position: vec4<f32>,
     @location(0) texture_coords: vec2<f32>,
+    @location(1) @interpolate(flat) sprite_id: u32,
 }
 
 @vertex
@@ -1164,6 +1194,7 @@ fn vs_path(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) insta
     var out = PathVarying();
     out.position = device_position;
     out.texture_coords = texture_coords;
+    out.sprite_id = instance_id;
 
     return out;
 }
@@ -1171,7 +1202,7 @@ fn vs_path(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) insta
 @fragment
 fn fs_path(input: PathVarying) -> @location(0) vec4<f32> {
     let sample = textureSample(t_sprite, s_sprite, input.texture_coords);
-    return sample;
+    return sample * rounded_clip_alpha(input.position.xy, load_path_sprite(input.sprite_id).clip);
 }
 
 // --- underlines --- //
@@ -1184,6 +1215,7 @@ struct Underline {
     color: Hsla,
     thickness: f32,
     wavy: u32,
+    clip: RoundedClipParams,
 }
 
 
@@ -1219,9 +1251,10 @@ fn fs_underline(input: UnderlineVarying) -> @location(0) vec4<f32> {
     }
 
     let underline = load_underline(input.underline_id);
+    let clip_alpha = rounded_clip_alpha(input.position.xy, underline.clip);
     if (underline.wavy == 0u)
     {
-        return blend_color(input.color, input.color.a);
+        return blend_color(input.color, clip_alpha);
     }
 
     let half_thickness = underline.thickness * 0.5;
@@ -1237,7 +1270,7 @@ fn fs_underline(input: UnderlineVarying) -> @location(0) vec4<f32> {
     let distance_from_top_border = distance_in_pixels - half_thickness;
     let distance_from_bottom_border = distance_in_pixels + half_thickness;
     let alpha = saturate(0.5 - max(-distance_from_bottom_border, distance_from_top_border));
-    return blend_color(input.color, alpha * input.color.a);
+    return blend_color(input.color, alpha * clip_alpha);
 }
 
 // --- monochrome sprites --- //
@@ -1349,6 +1382,7 @@ fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
 struct SurfaceParams {
     bounds: Bounds,
     content_mask: Bounds,
+    clip: RoundedClipParams,
 }
 
 @group(1) @binding(0) var<uniform> surface_locals: SurfaceParams;
@@ -1392,7 +1426,7 @@ fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
         textureSampleLevel(t_cb_cr, s_surface, input.texture_position, 0.0).rg,
         1.0);
 
-    return ycbcr_to_RGB * y_cb_cr;
+    return blend_color(ycbcr_to_RGB * y_cb_cr, rounded_clip_alpha(input.position.xy, surface_locals.clip));
 }
 
 // Adapted from zui crates/gpui_wgpu/src/shaders.wgsl: backdrop blur.
@@ -1459,11 +1493,13 @@ struct BackdropBlurParams {
     corner_radii: Corners,
     clip_bounds: Bounds,
     source_rect: vec4<f32>,
+    clip: RoundedClipParams,
 }
 
 @group(1) @binding(0) var<uniform> b_backdrop_blur: BackdropBlurParams;
 @group(1) @binding(1) var t_backdrop_blurred: texture_2d<f32>;
 @group(1) @binding(2) var s_backdrop_blurred: sampler;
+@group(1) @binding(3) var t_backdrop_snapshot: texture_2d<f32>;
 
 struct BackdropBlurVarying {
     @builtin(position) position: vec4<f32>,
@@ -1493,5 +1529,11 @@ fn fs_backdrop_blur(input: BackdropBlurVarying) -> @location(0) vec4<f32> {
         discard;
     }
     let uv = (input.device_position - params.source_rect.xy) / params.source_rect.zw;
-    return textureSampleLevel(t_backdrop_blurred, s_backdrop_blurred, uv, 0.0);
+    let blurred = textureSampleLevel(t_backdrop_blurred, s_backdrop_blurred, uv, 0.0);
+    let clip_alpha = rounded_clip_alpha(input.device_position, params.clip);
+    if (clip_alpha >= 1.0) {
+        return blurred;
+    }
+    let original = textureLoad(t_backdrop_snapshot, vec2<i32>(input.device_position - params.source_rect.xy), 0);
+    return mix(original, blurred, clip_alpha);
 }

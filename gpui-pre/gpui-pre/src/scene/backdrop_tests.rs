@@ -33,6 +33,7 @@ fn blur_at(bounds: Bounds<ScaledPixels>, sigma: f32) -> BackdropBlur {
         bounds,
         content_mask: ContentMask { bounds },
         corner_radii: Corners::default(),
+        clip: Default::default(),
     }
 }
 
@@ -48,6 +49,7 @@ fn shadow(color: Hsla) -> Shadow {
         element_corner_radii: Corners::default(),
         inset: 0,
         pad: 0,
+        clip: Default::default(),
     }
 }
 
@@ -58,6 +60,7 @@ fn blur() -> BackdropBlur {
         bounds: bounds(),
         content_mask: ContentMask { bounds: bounds() },
         corner_radii: Corners::default(),
+        clip: Default::default(),
     }
 }
 
@@ -526,10 +529,14 @@ fn invalid_geometry_is_rejected_and_sigma_is_bounded() {
 #[test]
 fn backdrop_instance_layout_matches_metal_bindings() {
     assert_eq!(align_of::<BackdropBlur>(), align_of::<f32>());
-    assert_eq!(size_of::<BackdropBlur>(), 56);
+    assert_eq!(size_of::<BackdropBlur>(), 88);
     assert_eq!(offset_of!(BackdropBlur, order), 0);
     assert_eq!(offset_of!(BackdropBlur, blur_radius), 4);
     assert_eq!(offset_of!(BackdropBlur, bounds), 8);
     assert_eq!(offset_of!(BackdropBlur, content_mask), 24);
     assert_eq!(offset_of!(BackdropBlur, corner_radii), 40);
+    assert_eq!(offset_of!(BackdropBlur, clip), 56);
+    assert_eq!(size_of::<RoundedClipParams>(), 32);
+    assert_eq!(size_of::<EdgeFadeParams>(), 64);
+    assert_eq!(offset_of!(EdgeFadeParams, clip), 32);
 }

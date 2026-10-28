@@ -1292,6 +1292,7 @@ pub struct Window {
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
     pub(crate) element_opacity: f32,
     pub(crate) edge_fade: Option<EdgeFade>,
+    pub(crate) rounded_clip: Option<(Bounds<Pixels>, Corners<Pixels>)>,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
     /// The [`TextInputConfiguration`] most recently forwarded to the platform
@@ -1307,7 +1308,7 @@ pub struct Window {
     pub(crate) tooltip_bounds: Option<TooltipBounds>,
     pub(crate) next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>>,
     pub(crate) dirty_views: FxHashSet<EntityId>,
-    pub(crate) fade_cache_invalidations: FxHashSet<EntityId>,
+    pub(crate) paint_effect_cache_invalidations: FxHashSet<EntityId>,
     focus_listeners: SubscriberSet<(), AnyWindowFocusListener>,
     pub(crate) focus_lost_listeners: SubscriberSet<(), AnyObserver>,
     focus_lost_path: SmallVec<[FocusId; 8]>,
@@ -2203,6 +2204,7 @@ impl Window {
             content_mask_stack: Vec::new(),
             element_opacity: 1.0,
             edge_fade: None,
+            rounded_clip: None,
             requested_autoscroll: None,
             last_text_input_configuration: None,
             focused_text_input: None,
@@ -2213,7 +2215,7 @@ impl Window {
             next_tooltip_id: TooltipId::default(),
             tooltip_bounds: None,
             dirty_views: FxHashSet::default(),
-            fade_cache_invalidations: FxHashSet::default(),
+            paint_effect_cache_invalidations: FxHashSet::default(),
             focus_listeners: SubscriberSet::new(),
             focus_lost_listeners: SubscriberSet::new(),
             focus_lost_path: SmallVec::new(),
@@ -3353,6 +3355,7 @@ impl Window {
                 .opacity(self.element_opacity_at(origin)),
             thickness: self.snap_stroke(style.thickness),
             wavy: style.wavy.into(),
+            clip: self.scaled_rounded_clip(),
         }
     }
 
@@ -3396,8 +3399,12 @@ impl Window {
 
     #[inline]
     fn snapped_content_mask(&self) -> ContentMask<ScaledPixels> {
+        let mask = self.content_mask();
+        if mask.bounds.is_empty() {
+            return mask.scale(self.scale_factor());
+        }
         ContentMask {
-            bounds: self.cover_bounds(self.content_mask().bounds),
+            bounds: self.cover_bounds(mask.bounds),
         }
     }
 
@@ -3499,7 +3506,7 @@ impl Window {
         #[cfg(feature = "profiler")]
         self.window_profiler.begin_draw();
 
-        let clear = self.draw_with_fade_retry(
+        let clear = self.draw_with_paint_effect_retry(
             cx,
             false,
             None,
@@ -3519,7 +3526,7 @@ impl Window {
         clear
     }
 
-    fn draw_with_fade_retry(
+    fn draw_with_paint_effect_retry(
         &mut self,
         cx: &mut App,
         retried: bool,
@@ -3572,7 +3579,7 @@ impl Window {
         self.dirty_views.clear();
         self.next_frame.window_active = self.active.get();
 
-        if !self.fade_cache_invalidations.is_empty() {
+        if !self.paint_effect_cache_invalidations.is_empty() {
             let previous_focus = previous_focus.unwrap_or_else(|| {
                 (
                     self.rendered_frame.focus_path(),
@@ -3587,16 +3594,16 @@ impl Window {
             self.refreshing = false;
             self.invalidator.set_phase(DrawPhase::None);
 
-            // Paint-only fade scopes cannot be compared during prepaint.
+            // Paint-only effect scopes cannot be compared during prepaint.
             // Redraw affected views before publishing focus and input state.
-            let mut invalid = mem::take(&mut self.fade_cache_invalidations);
+            let mut invalid = mem::take(&mut self.paint_effect_cache_invalidations);
             let mut refresh_all = retried;
             for &view in &invalid {
                 self.mark_view_dirty(view);
                 refresh_all |= !self.dirty_views.contains(&view);
             }
             invalid.clear();
-            self.fade_cache_invalidations = invalid;
+            self.paint_effect_cache_invalidations = invalid;
             self.refreshing |= refresh_all;
             arena_scope.exit(&cx.element_arena).clear(cx);
 
@@ -3609,7 +3616,7 @@ impl Window {
                 };
                 frame_dirty.invalidations += retry_dirty.invalidations;
             }
-            return self.draw_with_fade_retry(
+            return self.draw_with_paint_effect_retry(
                 cx,
                 true,
                 Some(previous_focus),
@@ -3912,7 +3919,7 @@ impl Window {
 
         let should_send_a11y_update = a11y_active_start_of_frame
             && a11y_active_end_of_frame
-            && self.fade_cache_invalidations.is_empty();
+            && self.paint_effect_cache_invalidations.is_empty();
 
         if a11y_active_start_of_frame {
             // Harvest frame metadata for the debug dump while the live window
@@ -4387,6 +4394,58 @@ impl Window {
         result
     }
 
+    /// Runs `f` under an antialiased rounded clip in window coordinates.
+    ///
+    /// Nested scopes use the innermost rounded outline; all enclosing
+    /// rectangular content masks still intersect. Hitboxes use that rectangular
+    /// intersection, not the rounded outline. Deferred draws are painted in a
+    /// separate scope and do not inherit this outline.
+    ///
+    /// Empty or non-finite bounds, non-finite radii, and geometry that cannot
+    /// be represented in device pixels clip everything. Negative radii become
+    /// zero and radii are clamped to half the shorter side.
+    ///
+    /// Adapted from zui `crates/gpui/src/window.rs` at
+    /// b564a34413bb7ef1da04121c4a287758f94993d9 (Apache-2.0).
+    pub fn with_rounded_clip<R>(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        radii: impl Into<Corners<Pixels>>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_paint_or_prepaint();
+        let radii = radii.into();
+        let scale = self.scale_factor();
+        let valid = [
+            bounds.left().0,
+            bounds.top().0,
+            bounds.right().0,
+            bounds.bottom().0,
+            bounds.size.width.0,
+            bounds.size.height.0,
+            radii.top_left.0,
+            radii.top_right.0,
+            radii.bottom_right.0,
+            radii.bottom_left.0,
+        ]
+        .into_iter()
+        .all(|value| value.is_finite() && (value * scale).is_finite())
+            && scale.is_finite()
+            && scale > 0.
+            && bounds.size.width.0 > 0.
+            && bounds.size.height.0 > 0.;
+        let (bounds, radii) = if valid {
+            let max = bounds.size.width.0.min(bounds.size.height.0) * 0.5;
+            (bounds, radii.map(|radius| px(radius.0.max(0.).min(max))))
+        } else {
+            (Bounds::default(), Corners::default())
+        };
+        let previous = self.rounded_clip.replace((bounds, radii));
+        let result = self.with_content_mask(Some(ContentMask { bounds }), f);
+        self.rounded_clip = previous;
+        result
+    }
+
     /// Perform prepaint on child elements in a "retryable" manner, so that any side effects
     /// of prepaints can be discarded before prepainting again. This is used to support autoscroll
     /// where we need to prepaint children to detect the autoscroll bounds, then adjust the
@@ -4519,11 +4578,31 @@ impl Window {
         opacity * ramp * ramp
     }
 
-    fn scaled_edge_fade(&self) -> crate::EdgeFadeParams {
-        let Some(fade) = &self.edge_fade else {
+    fn scaled_rounded_clip(&self) -> crate::RoundedClipParams {
+        let Some((bounds, radii)) = self.rounded_clip else {
             return Default::default();
         };
         let scale = self.scale_factor();
+        crate::RoundedClipParams {
+            left: bounds.left().0 * scale,
+            top: bounds.top().0 * scale,
+            right: bounds.right().0 * scale,
+            bottom: bounds.bottom().0 * scale,
+            top_left: radii.top_left.0 * scale,
+            top_right: radii.top_right.0 * scale,
+            bottom_right: radii.bottom_right.0 * scale,
+            bottom_left: radii.bottom_left.0 * scale,
+        }
+    }
+
+    fn scaled_edge_fade(&self) -> crate::EdgeFadeParams {
+        let scale = self.scale_factor();
+        let Some(fade) = &self.edge_fade else {
+            return crate::EdgeFadeParams {
+                clip: self.scaled_rounded_clip(),
+                ..Default::default()
+            };
+        };
         crate::EdgeFadeParams {
             top_y: fade.bounds.top().0 * scale,
             bottom_y: fade.bounds.bottom().0 * scale,
@@ -4549,6 +4628,7 @@ impl Window {
             } else {
                 0.0
             },
+            clip: self.scaled_rounded_clip(),
         }
     }
 
@@ -4829,6 +4909,7 @@ impl Window {
                 element_corner_radii,
                 inset: 0,
                 pad: 0,
+                clip: self.scaled_rounded_clip(),
             });
         }
     }
@@ -4874,6 +4955,7 @@ impl Window {
                 element_corner_radii,
                 inset: 1,
                 pad: 0,
+                clip: self.scaled_rounded_clip(),
             });
         }
     }
@@ -4898,6 +4980,7 @@ impl Window {
             bounds: self.snap_bounds(bounds),
             content_mask: self.snapped_content_mask(),
             corner_radii: corner_radii.scale(scale),
+            clip: self.scaled_rounded_clip(),
         };
         if !blur.is_valid() || blur.bounds.intersect(&blur.content_mask.bounds).is_empty() {
             return;
@@ -4915,6 +4998,7 @@ impl Window {
             element_corner_radii: blur.corner_radii,
             inset: 0,
             pad: 0,
+            clip: blur.clip,
         });
         self.next_frame.scene.insert_backdrop_blur(blur);
     }
@@ -5048,9 +5132,9 @@ impl Window {
         path.content_mask = content_mask;
         let color: Background = color.into();
         path.color = color.opacity(opacity);
-        self.next_frame
-            .scene
-            .insert_primitive(path.scale(scale_factor));
+        let mut path = path.scale(scale_factor);
+        path.clip = self.scaled_rounded_clip();
+        self.next_frame.scene.insert_primitive(path);
     }
 
     /// Paint an underline into the scene for the next frame at the current z-index.
@@ -5094,6 +5178,7 @@ impl Window {
             thickness: self.snap_stroke(style.thickness),
             color: style.color.unwrap_or_default().opacity(opacity),
             wavy: false.into(),
+            clip: self.scaled_rounded_clip(),
         });
     }
 
@@ -5459,6 +5544,7 @@ impl Window {
             order: 0,
             bounds,
             content_mask,
+            clip: self.scaled_rounded_clip(),
             image_buffer,
         });
     }
@@ -9756,6 +9842,7 @@ mod tests {
                 right_x: 110. * scale,
                 band_left: 10. * scale,
                 band_right: 0.,
+                clip: Default::default(),
             };
             let inner_params = EdgeFadeParams {
                 band_top: 0.,
@@ -9833,6 +9920,153 @@ mod tests {
             assert_eq!(sprites[0].opacity, 0.5);
             assert_eq!(window.edge_fade, None);
             assert_eq!(window.element_opacity(), 1.);
+        });
+    }
+
+    #[gpui::test]
+    fn rounded_clip_scopes_restore_and_cover_scene_primitives_at_each_scale(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::{BoxShadow, EdgeFade, Path, RenderImage, RoundedClipParams, StrikethroughStyle, fill};
+        use std::sync::Arc;
+
+        test_underline_paint_at_scales(cx, |window| {
+            let scale = window.scale_factor();
+            let bounds = Bounds::new(point(px(10.), px(20.)), size(px(100.), px(80.)));
+            let inner = Bounds::new(point(px(15.), px(25.)), size(px(120.), px(90.)));
+            let radii = Corners {
+                top_left: px(-3.),
+                top_right: px(10.),
+                bottom_right: px(100.),
+                bottom_left: px(0.),
+            };
+            let expected = RoundedClipParams {
+                left: 10. * scale,
+                top: 20. * scale,
+                right: 110. * scale,
+                bottom: 100. * scale,
+                top_left: 0.,
+                top_right: 10. * scale,
+                bottom_right: 40. * scale,
+                bottom_left: 0.,
+            };
+            let color = hsla(0., 0., 1., 1.);
+            let image = Arc::new(RenderImage::new(smallvec::smallvec![image::Frame::new(
+                image::RgbaImage::from_pixel(4, 4, image::Rgba([255, 255, 255, 255])),
+            )]));
+            let origin = point(px(20.), px(30.));
+            let mut path = Path::new(origin);
+            path.push_triangle(
+                (origin, point(px(40.), px(30.)), point(px(20.), px(40.))),
+                (point(0., 1.), point(0., 1.), point(0., 1.)),
+            );
+            let underline = UnderlineStyle {
+                thickness: px(1.),
+                color: Some(color),
+                wavy: false,
+            };
+            let fade = EdgeFade {
+                bounds,
+                band: px(10.),
+                band_top: None,
+                band_bottom: None,
+                band_left: None,
+                band_right: None,
+                top: true,
+                bottom: false,
+                left: false,
+                right: false,
+            };
+            let original_mask = window.content_mask();
+            window.next_frame.scene.clear();
+            let result = window.with_rounded_clip(bounds, radii, |window| {
+                assert_eq!(window.scaled_rounded_clip(), expected);
+                assert_eq!(window.content_mask().bounds, bounds);
+                window.with_edge_fade(Some(fade), |window| window.paint_quad(fill(bounds, color)));
+                window
+                    .paint_image(bounds, bounds, Corners::default(), image, 0, false)
+                    .unwrap();
+                window.paint_path(path, color);
+                window.paint_underline(origin, px(20.), &underline);
+                window.paint_strikethrough(
+                    origin,
+                    px(20.),
+                    &StrikethroughStyle {
+                        thickness: px(1.),
+                        color: Some(color),
+                    },
+                );
+                window.paint_drop_shadows(
+                    bounds,
+                    Corners::default(),
+                    &[BoxShadow::new(px(0.), px(0.), color)],
+                );
+                window.paint_backdrop_blur(bounds, Corners::default(), px(4.));
+                window.with_rounded_clip(inner, px(8.), |window| {
+                    assert_eq!(window.content_mask().bounds, bounds.intersect(&inner));
+                    let clip = window.scaled_rounded_clip();
+                    assert_eq!(clip.left, 15. * scale);
+                    assert_eq!(clip.top_left, 8. * scale);
+                    window.paint_quad(fill(bounds, color));
+                });
+                assert_eq!(window.scaled_rounded_clip(), expected);
+                assert_eq!(window.content_mask().bounds, bounds);
+                42
+            });
+            assert_eq!(result, 42);
+            assert_eq!(window.rounded_clip, None);
+            assert_eq!(window.content_mask(), original_mask);
+            let scene = &window.next_frame.scene;
+            assert_eq!(scene.quads[0].fade.clip, expected);
+            assert_eq!(scene.quads[0].fade.band_top, 10. * scale);
+            assert_eq!(scene.polychrome_sprites[0].fade.clip, expected);
+            assert_eq!(scene.paths[0].clip, expected);
+            assert!(
+                scene
+                    .underlines
+                    .iter()
+                    .all(|underline| underline.clip == expected)
+            );
+            assert!(scene.shadows.iter().all(|shadow| shadow.clip == expected));
+            assert_eq!(scene.backdrop_blurs[0].clip, expected);
+            assert_ne!(scene.quads[1].fade.clip, expected);
+        });
+    }
+
+    #[gpui::test]
+    fn invalid_rounded_clip_is_empty_and_does_not_escape_its_scope(cx: &mut TestAppContext) {
+        use crate::fill;
+        test_underline_paint_at_scales(cx, |window| {
+            let rect =
+                |x, y, width, height| Bounds::new(point(px(x), px(y)), size(px(width), px(height)));
+            let bounds = rect(10., 10., 20., 20.);
+            let original_mask = window.content_mask();
+            for (invalid, radius) in [
+                (rect(10., 10., 0., 20.), px(4.)),
+                (rect(10., 10., 20., -1.), px(4.)),
+                (rect(f32::NAN, 10., 20., 20.), px(4.)),
+                (rect(10., 10., f32::INFINITY, 20.), px(4.)),
+                (rect(f32::MAX, 10., f32::MAX, 20.), px(4.)),
+                (bounds, px(f32::NAN)),
+                (bounds, px(f32::INFINITY)),
+            ] {
+                window.next_frame.scene.clear();
+                let result = window.with_rounded_clip(invalid, radius, |window| {
+                    assert!(window.content_mask().bounds.is_empty());
+                    window.paint_quad(fill(bounds, crate::white()));
+                    window.paint_backdrop_blur(bounds, Corners::default(), px(4.));
+                    window.with_rounded_clip(bounds, px(4.), |window| {
+                        assert!(window.content_mask().bounds.is_empty());
+                        assert!(window.snapped_content_mask().bounds.is_empty());
+                        window.paint_quad(fill(bounds, crate::white()));
+                    });
+                    9
+                });
+                assert_eq!(result, 9);
+                assert_eq!(window.next_frame.scene.len(), 0);
+                assert_eq!(window.rounded_clip, None);
+                assert_eq!(window.content_mask(), original_mask);
+            }
         });
     }
 

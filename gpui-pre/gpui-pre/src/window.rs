@@ -5350,6 +5350,7 @@ impl Window {
                 tile,
                 opacity,
                 fade: self.scaled_edge_fade(),
+                alpha_mask: Default::default(),
             });
         }
         Ok(())
@@ -5429,6 +5430,8 @@ impl Window {
     ///
     /// The visible region rendered is `bounds.intersect(&image_bounds)`, with `corner_radii`
     /// applied to `bounds`.
+    /// `alpha_mask`, if present, excludes a window-space region without
+    /// changing the source image or uploading a new atlas tile.
     pub fn paint_image(
         &mut self,
         bounds: Bounds<Pixels>,
@@ -5437,6 +5440,7 @@ impl Window {
         data: Arc<RenderImage>,
         frame_index: usize,
         grayscale: bool,
+        alpha_mask: Option<crate::ImageAlphaMask>,
     ) -> Result<()> {
         self.invalidator.debug_assert_paint();
 
@@ -5513,6 +5517,9 @@ impl Window {
             .clamp_radii_for_quad_size(visible_bounds.size)
             .scale(self.scale_factor());
         let opacity = self.element_opacity();
+        let alpha_mask = alpha_mask
+            .map(|mask| mask.scale(self.scale_factor()))
+            .unwrap_or_default();
 
         self.next_frame.scene.insert_primitive(PolychromeSprite {
             order: 0,
@@ -5524,6 +5531,7 @@ impl Window {
             tile: sub_tile,
             opacity,
             fade: self.scaled_edge_fade(),
+            alpha_mask,
         });
         Ok(())
     }
@@ -9865,7 +9873,15 @@ mod tests {
                 window.with_edge_fade(Some(outer), |window| {
                     window.paint_quad(fill(bounds, color));
                     window
-                        .paint_image(bounds, bounds, Default::default(), image.clone(), 0, false)
+                        .paint_image(
+                            bounds,
+                            bounds,
+                            Default::default(),
+                            image.clone(),
+                            0,
+                            false,
+                            None,
+                        )
                         .unwrap();
                     assert_eq!(window.element_opacity_at(point(px(15.), px(30.))), 0.125);
                     assert_eq!(window.element_opacity_at(point(px(40.), px(99.5))), 0.125);
@@ -9891,6 +9907,7 @@ mod tests {
                                 image.clone(),
                                 0,
                                 false,
+                                None,
                             )
                             .unwrap();
                         assert_eq!(window.element_opacity_at(point(px(108.), px(50.))), 0.125);
@@ -9973,7 +9990,9 @@ mod tests {
     fn rounded_clip_scopes_restore_and_cover_scene_primitives_at_each_scale(
         cx: &mut TestAppContext,
     ) {
-        use crate::{BoxShadow, EdgeFade, Path, RenderImage, RoundedClipParams, StrikethroughStyle, fill};
+        use crate::{
+            BoxShadow, EdgeFade, Path, RenderImage, RoundedClipParams, StrikethroughStyle, fill,
+        };
         use std::sync::Arc;
 
         test_underline_paint_at_scales(cx, |window| {
@@ -10030,7 +10049,7 @@ mod tests {
                 assert_eq!(window.content_mask().bounds, bounds);
                 window.with_edge_fade(Some(fade), |window| window.paint_quad(fill(bounds, color)));
                 window
-                    .paint_image(bounds, bounds, Corners::default(), image, 0, false)
+                    .paint_image(bounds, bounds, Corners::default(), image, 0, false, None)
                     .unwrap();
                 window.paint_path(path, color);
                 window.paint_underline(origin, px(20.), &underline);
@@ -10113,6 +10132,117 @@ mod tests {
                 assert_eq!(window.rounded_clip, None);
                 assert_eq!(window.content_mask(), original_mask);
             }
+        });
+    }
+
+    #[gpui::test]
+    fn image_alpha_mask_scales_and_reuses_atlas_tile_across_frames(cx: &mut TestAppContext) {
+        use crate::{
+            EdgeFade, ImageAlphaMask, ImageAlphaMaskParams, RenderImage, RenderImageParams,
+        };
+        use std::sync::Arc;
+
+        let image = Arc::new(RenderImage::new(smallvec::smallvec![image::Frame::new(
+            image::RgbaImage::from_pixel(4, 4, image::Rgba([80, 150, 230, 180])),
+        )]));
+        let previous_tile = Rc::new(Cell::new(None));
+        test_underline_paint_at_scales(cx, move |window| {
+            let scale = window.scale_factor();
+            let bounds = Bounds::new(point(px(10.), px(20.)), size(px(80.), px(60.)));
+            let mut mask = ImageAlphaMask::new(
+                Bounds::new(point(px(30.), px(35.)), size(px(20.), px(16.))),
+                px(5.),
+                px(12.),
+            );
+            mask.clearance = px(3.);
+            mask.bottom_fade = Some((px(75.), px(8.)));
+            let mut moved = mask;
+            moved.bounds.origin.x += px(4.);
+            let fade = EdgeFade {
+                bounds,
+                band: px(10.),
+                band_top: None,
+                band_bottom: None,
+                band_left: None,
+                band_right: None,
+                top: true,
+                bottom: false,
+                left: false,
+                right: false,
+            };
+            window.next_frame.scene.clear();
+            window.with_element_opacity(Some(0.5), |window| {
+                window.with_rounded_clip(bounds, px(8.), |window| {
+                    window.with_edge_fade(Some(fade), |window| {
+                        for alpha_mask in [Some(mask), Some(moved), None] {
+                            window
+                                .paint_image(
+                                    bounds,
+                                    bounds,
+                                    Corners::default(),
+                                    image.clone(),
+                                    0,
+                                    false,
+                                    alpha_mask,
+                                )
+                                .unwrap();
+                        }
+                        let fitted = Bounds::new(point(px(0.), px(10.)), size(px(100.), px(80.)));
+                        window
+                            .paint_image(
+                                bounds,
+                                fitted,
+                                Corners::default(),
+                                image.clone(),
+                                0,
+                                false,
+                                Some(mask),
+                            )
+                            .unwrap();
+                    });
+                });
+            });
+            let sprites = &window.next_frame.scene.polychrome_sprites;
+            assert_eq!(sprites.len(), 4);
+            assert_eq!(sprites[0].alpha_mask, mask.scale(scale));
+            assert_eq!(sprites[1].alpha_mask, moved.scale(scale));
+            assert_eq!(sprites[2].alpha_mask, ImageAlphaMaskParams::default());
+            assert_eq!(sprites[3].alpha_mask, mask.scale(scale));
+            assert!(sprites.iter().all(|sprite| sprite.opacity == 0.5));
+            assert!(
+                sprites
+                    .iter()
+                    .all(|sprite| sprite.fade.band_top == 10. * scale)
+            );
+            assert!(
+                sprites
+                    .iter()
+                    .all(|sprite| sprite.fade.clip.top_left == 8. * scale)
+            );
+            assert!(
+                sprites[..3]
+                    .iter()
+                    .all(|sprite| sprite.tile == sprites[0].tile)
+            );
+            assert_eq!(sprites[3].tile.texture_id, sprites[0].tile.texture_id);
+            assert_eq!(sprites[3].tile.tile_id, sprites[0].tile.tile_id);
+            assert_ne!(sprites[3].tile.bounds, sprites[0].tile.bounds);
+            if let Some(tile) = previous_tile.get() {
+                assert_eq!(sprites[0].tile, tile);
+            } else {
+                previous_tile.set(Some(sprites[0].tile));
+            }
+            let key = RenderImageParams {
+                image_id: image.id,
+                frame_index: 0,
+            }
+            .into();
+            let tile = window
+                .sprite_atlas
+                .get_or_insert_with(key, &mut || panic!("moving the mask reuploaded the image"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(sprites[0].tile, tile);
         });
     }
 

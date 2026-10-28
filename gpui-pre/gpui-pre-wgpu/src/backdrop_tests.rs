@@ -859,6 +859,7 @@ fn rounded_sprite_clipping_preserves_fade_opacity_and_order() -> anyhow::Result<
                     content_mask: mask,
                     corner_radii: Corners::default(),
                     fade,
+                    alpha_mask: Default::default(),
                 }),
             }
             scene
@@ -1049,11 +1050,21 @@ fn mixed_path_batches_preserve_alpha_and_order() -> anyhow::Result<()> {
         blue.a = 0.5;
         let green = gpui::hsla(1. / 3., 1., 0.5, 0.5);
         let mut scene = Scene::default();
-        scene.paths.push(rectangular_path(red, RoundedClipParams::default(), 0));
-        scene.paths.push(rectangular_path(blue, RoundedClipParams::default(), 1));
-        scene.paths.push(rectangular_path(green, asymmetric_clip(), 2));
-        scene.paths.push(rectangular_path(red, RoundedClipParams::default(), 3));
-        scene.paths.push(rectangular_path(blue, RoundedClipParams::default(), 4));
+        scene
+            .paths
+            .push(rectangular_path(red, RoundedClipParams::default(), 0));
+        scene
+            .paths
+            .push(rectangular_path(blue, RoundedClipParams::default(), 1));
+        scene
+            .paths
+            .push(rectangular_path(green, asymmetric_clip(), 2));
+        scene
+            .paths
+            .push(rectangular_path(red, RoundedClipParams::default(), 3));
+        scene
+            .paths
+            .push(rectangular_path(blue, RoundedClipParams::default(), 4));
         scene.finish();
         let image = render_transparent(&mut renderer, &scene)?;
         for (x, y, expected) in [
@@ -1077,7 +1088,10 @@ fn fractional_rounded_path_edge_is_clipped_after_msaa_resolve() -> anyhow::Resul
         if texture_instances {
             use_texture_instances(&mut renderer);
         }
-        let formats = renderer.context.adapter.get_texture_format_features(renderer.core.target_format);
+        let formats = renderer
+            .context
+            .adapter
+            .get_texture_format_features(renderer.core.target_format);
         for sample_count in [1, 4] {
             if !formats.flags.sample_count_supported(sample_count) {
                 continue;
@@ -1088,8 +1102,14 @@ fn fractional_rounded_path_edge_is_clipped_after_msaa_resolve() -> anyhow::Resul
             let mut red = gpui::red();
             red.a = 0.5;
             let clip = RoundedClipParams {
-                left: 8.75, top: 8.75, right: 55.25, bottom: 55.25,
-                top_left: 8.0, top_right: 8.0, bottom_right: 8.0, bottom_left: 8.0,
+                left: 8.75,
+                top: 8.75,
+                right: 55.25,
+                bottom: 55.25,
+                top_left: 8.0,
+                top_right: 8.0,
+                bottom_right: 8.0,
+                bottom_left: 8.0,
             };
             let mut path = rectangular_path(red, clip, 0);
             // A rounded scope supplies the outward-covered rectangular content mask.
@@ -1229,6 +1249,199 @@ fn rounded_clip_scales_wavy_underline_and_inset_shadow_coverage() -> anyhow::Res
                 "inset={inset}, unmasked={before:?}, clipped={after:?}, expected={expected}"
             );
         }
+    }
+    Ok(())
+}
+
+fn translucent_image_tile(renderer: &WgpuHeadlessRenderer) -> anyhow::Result<gpui::AtlasTile> {
+    let key = gpui::AtlasKey::Image(gpui::RenderImageParams {
+        image_id: gpui::ImageId(771),
+        frame_index: 0,
+    });
+    renderer
+        .core
+        .atlas
+        .get_or_insert_with(key, &mut || {
+            let mut bytes = vec![255; 16 * 16 * 4];
+            for pixel in bytes.chunks_exact_mut(4) {
+                pixel[3] = 128;
+            }
+            Ok(Some((device_size(16, 16), std::borrow::Cow::Owned(bytes))))
+        })?
+        .ok_or_else(|| anyhow::anyhow!("atlas did not create an image tile"))
+}
+
+fn masked_image_sprite(tile: gpui::AtlasTile) -> gpui::PolychromeSprite {
+    gpui::PolychromeSprite {
+        order: 1,
+        pad: 0,
+        tile,
+        grayscale: false.into(),
+        opacity: 0.5,
+        bounds: bounds(8.0, 8.0, 48.0, 48.0),
+        content_mask: ContentMask {
+            bounds: bounds(0.0, 0.0, 64.0, 64.0),
+        },
+        corner_radii: Corners::default(),
+        fade: EdgeFadeParams::default(),
+        alpha_mask: gpui::ImageAlphaMaskParams::default(),
+    }
+}
+
+fn mask_smoothstep(value: f32) -> f32 {
+    let value = value.clamp(0.0, 1.0);
+    value * value * (3.0 - 2.0 * value)
+}
+
+fn assert_white_premultiplied(image: &image::RgbaImage, x: u32, y: u32, alpha: f32) {
+    let expected = alpha.round() as u8;
+    let pixel = image.get_pixel(x, y).0;
+    assert!(
+        pixel.iter().all(|channel| channel.abs_diff(expected) <= 2),
+        "pixel ({x}, {y})={pixel:?}, expected premultiplied white alpha {expected}"
+    );
+}
+
+#[test]
+fn image_mask_pixels_feather_bottom_alpha_and_atlas_reuse() -> anyhow::Result<()> {
+    for texture_instances in [false, true] {
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        if texture_instances {
+            use_texture_instances(&mut renderer);
+        }
+        enable_transparent_target(&mut renderer);
+        let atlas = renderer.core.atlas.clone();
+        let tile = translucent_image_tile(&renderer)?;
+        assert_eq!(atlas.upload_count(), 0);
+
+        let mut scene = Scene::default();
+        scene.polychrome_sprites.push(masked_image_sprite(tile));
+        scene.finish();
+        let baseline = render_transparent(&mut renderer, &scene)?;
+        assert_eq!(atlas.upload_count(), 1);
+        assert_white_premultiplied(&baseline, 31, 27, 64.0);
+        assert_white_premultiplied(&baseline, 15, 46, 64.0);
+
+        let mask = gpui::ImageAlphaMaskParams {
+            bounds: bounds(24.0, 20.0, 16.0, 16.0),
+            radius: 4.0,
+            feather: 4.0,
+            clearance: 2.0,
+            bottom_y: 45.0,
+            bottom_feather: 8.0,
+            pad: 0.0,
+        };
+        scene.polychrome_sprites[0].alpha_mask = gpui::ImageAlphaMaskParams {
+            feather: 0.0,
+            ..mask
+        };
+        assert_eq!(render_transparent(&mut renderer, &scene)?, baseline);
+        scene.polychrome_sprites[0].alpha_mask.feather = -1.0;
+        assert_eq!(render_transparent(&mut renderer, &scene)?, baseline);
+
+        scene.polychrome_sprites[0].alpha_mask = mask;
+        let clipped = render_transparent(&mut renderer, &scene)?;
+        assert_white_premultiplied(&clipped, 31, 27, 0.0);
+        assert_white_premultiplied(&clipped, 15, 27, 64.0);
+        assert_white_premultiplied(&clipped, 44, 27, 64.0 * mask_smoothstep(2.5 / 4.0));
+        assert_white_premultiplied(&clipped, 20, 27, 64.0 * mask_smoothstep(1.5 / 4.0));
+        let corner_distance = 6.5_f32.hypot(6.5) - 4.0;
+        assert_white_premultiplied(
+            &clipped,
+            21,
+            17,
+            64.0 * mask_smoothstep((corner_distance - 2.0) / 4.0),
+        );
+        assert_white_premultiplied(&clipped, 21, 24, 64.0 * mask_smoothstep(0.5 / 4.0));
+        assert_white_premultiplied(&clipped, 15, 41, 64.0 * mask_smoothstep(3.5 / 8.0));
+        assert_white_premultiplied(&clipped, 15, 46, 0.0);
+        // At this pixel both ramps are partial; the reference combines them with min.
+        assert_white_premultiplied(&clipped, 31, 40, 64.0 * mask_smoothstep(4.5 / 8.0));
+
+        scene.polychrome_sprites[0].alpha_mask.bottom_feather = 0.0;
+        let no_bottom = render_transparent(&mut renderer, &scene)?;
+        assert_white_premultiplied(&no_bottom, 15, 46, 64.0);
+        assert_white_premultiplied(&no_bottom, 31, 27, 0.0);
+        scene.polychrome_sprites[0].alpha_mask.bottom_feather = -1.0;
+        assert_eq!(render_transparent(&mut renderer, &scene)?, no_bottom);
+
+        scene.polychrome_sprites[0].alpha_mask = mask;
+        scene.polychrome_sprites[0].alpha_mask.bounds = bounds(40.0, 20.0, 12.0, 16.0);
+        let moved = render_transparent(&mut renderer, &scene)?;
+        assert_white_premultiplied(&moved, 31, 27, 64.0);
+        assert_eq!(translucent_image_tile(&renderer)?, tile);
+        assert_eq!(
+            atlas.upload_count(),
+            1,
+            "mask changes must not upload the atlas tile"
+        );
+
+        scene.polychrome_sprites[0].alpha_mask = mask;
+        scene
+            .quads
+            .push(quad(0, bounds(0.0, 0.0, 64.0, 64.0), gpui::blue()));
+        scene
+            .quads
+            .push(quad(2, bounds(30.0, 30.0, 4.0, 4.0), gpui::red()));
+        scene.finish();
+        // The transparent pipeline remains active, so read back its premultiplied result.
+        let ordered = render_transparent(&mut renderer, &scene)?;
+        assert_eq!(ordered.get_pixel(31, 27).0, [0, 0, 255, 255]);
+        let image_pixel = ordered.get_pixel(15, 27).0;
+        assert!(
+            image_pixel[0].abs_diff(64) <= 2
+                && image_pixel[1].abs_diff(64) <= 2
+                && image_pixel[2] == 255
+                && image_pixel[3] == 255,
+            "{image_pixel:?}"
+        );
+        assert_eq!(ordered.get_pixel(31, 31).0, [255, 0, 0, 255]);
+        assert_eq!(atlas.upload_count(), 1);
+    }
+    Ok(())
+}
+
+#[test]
+fn image_mask_multiplies_source_alpha_fade_and_rounded_clip_once() -> anyhow::Result<()> {
+    for texture_instances in [false, true] {
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        if texture_instances {
+            use_texture_instances(&mut renderer);
+        }
+        enable_transparent_target(&mut renderer);
+        let tile = translucent_image_tile(&renderer)?;
+        let mut first = masked_image_sprite(tile);
+        first.order = 0;
+        first.bounds = bounds(0.0, 0.0, 4.0, 4.0);
+        let mut sprite = masked_image_sprite(tile);
+        sprite.fade = EdgeFadeParams {
+            left_x: 0.5,
+            band_left: 16.0,
+            clip: asymmetric_clip(),
+            ..Default::default()
+        };
+        sprite.alpha_mask = gpui::ImageAlphaMaskParams {
+            bounds: bounds(8.0, 12.0, 2.0, 2.0),
+            radius: 0.0,
+            feather: 5.0,
+            clearance: 0.0,
+            bottom_y: 0.0,
+            bottom_feather: 0.0,
+            pad: 0.0,
+        };
+        let mut scene = Scene::default();
+        // The second instance starts halfway through a WebGL texel at 50 words per record.
+        scene.polychrome_sprites.extend([first, sprite]);
+        scene
+            .quads
+            .push(quad(2, bounds(30.0, 30.0, 4.0, 4.0), gpui::red()));
+        scene.finish();
+        let image = render_transparent(&mut renderer, &scene)?;
+        let clip = (0.5 - (11.5_f32.hypot(10.5) - 16.0)).clamp(0.0, 1.0);
+        let expected = 128.0 * 0.5 * 0.75_f32.powi(2) * 0.5 * clip;
+        assert_white_premultiplied(&image, 12, 13, expected);
+        assert_eq!(image.get_pixel(8, 8).0, [0, 0, 0, 0]);
+        assert_eq!(image.get_pixel(31, 31).0, [255, 0, 0, 255]);
     }
     Ok(())
 }

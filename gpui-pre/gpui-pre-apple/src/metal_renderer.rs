@@ -2239,9 +2239,10 @@ mod tests {
 mod backdrop_blur_tests {
     use super::*;
     use gpui::{
-        Corners, DrawOrder, EdgeFadeParams, Edges, FontId, GlyphId, ImageId, MonochromeSprite,
-        PlatformAtlas, PolychromeSprite, Quad, RenderGlyphParams, RenderImageParams,
-        RenderSvgParams, Shadow, TransformationMatrix, Underline, px, rgba, solid_background,
+        Corners, DrawOrder, EdgeFadeParams, Edges, FontId, GlyphId, ImageAlphaMaskParams, ImageId,
+        MonochromeSprite, PlatformAtlas, PolychromeSprite, Quad, RenderGlyphParams,
+        RenderImageParams, RenderSvgParams, Shadow, TransformationMatrix, Underline, px, rgba,
+        solid_background,
     };
     use std::borrow::Cow;
 
@@ -2376,7 +2377,21 @@ mod backdrop_blur_tests {
         assert_eq!(mem::offset_of!(PathSprite, clip), 16);
         assert_eq!(mem::size_of::<Quad>(), 224);
         assert_eq!(mem::size_of::<MonochromeSprite>(), 176);
-        assert_eq!(mem::size_of::<PolychromeSprite>(), 160);
+        assert_eq!(mem::size_of::<PolychromeSprite>(), 200);
+        assert_eq!(mem::size_of::<ImageAlphaMaskParams>(), 40);
+        assert_eq!(
+            [
+                mem::offset_of!(ImageAlphaMaskParams, bounds),
+                mem::offset_of!(ImageAlphaMaskParams, radius),
+                mem::offset_of!(ImageAlphaMaskParams, feather),
+                mem::offset_of!(ImageAlphaMaskParams, clearance),
+                mem::offset_of!(ImageAlphaMaskParams, bottom_y),
+                mem::offset_of!(ImageAlphaMaskParams, bottom_feather),
+                mem::offset_of!(ImageAlphaMaskParams, pad),
+            ],
+            [0, 16, 20, 24, 28, 32, 36]
+        );
+        assert_eq!(mem::offset_of!(PolychromeSprite, alpha_mask), 160);
         assert_eq!(mem::offset_of!(Quad, fade), 160);
         assert_eq!(mem::offset_of!(MonochromeSprite, fade), 112);
         assert_eq!(mem::offset_of!(gpui::PolychromeSprite, fade), 96);
@@ -2421,6 +2436,7 @@ mod backdrop_blur_tests {
                     "content_mask",
                     "corner_radii",
                     "fade",
+                    "alpha_mask",
                 ][..],
             ),
         ] {
@@ -2441,7 +2457,28 @@ mod backdrop_blur_tests {
                 .collect();
             assert!(positions.windows(2).all(|pair| pair[0] < pair[1]), "{name}");
             assert!(definition.contains("EdgeFadeParams fade;"), "{name}");
+            if name == "PolychromeSprite" {
+                assert!(definition.contains("ImageAlphaMaskParams alpha_mask;"));
+            }
         }
+        let definition = header
+            .split("struct ImageAlphaMaskParams {")
+            .nth(1)
+            .expect("ImageAlphaMaskParams missing from generated Metal header")
+            .split('}')
+            .next()
+            .unwrap();
+        let positions = [
+            "bounds",
+            "radius",
+            "feather",
+            "clearance",
+            "bottom_y",
+            "bottom_feather",
+            "pad",
+        ]
+        .map(|field| definition.find(&format!(" {field};")).unwrap());
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
         let definition = header
             .split("struct EdgeFadeParams {")
             .nth(1)
@@ -2843,6 +2880,7 @@ mod backdrop_blur_tests {
                         },
                         corner_radii: Corners::default(),
                         fade,
+                        alpha_mask: Default::default(),
                     }),
                 }
                 images.push(render(&mut renderer, &mut scene, 64, 64));
@@ -3055,15 +3093,11 @@ mod backdrop_blur_tests {
         let arc = image.get_pixel(13, 13);
         assert!((59..=64).contains(&arc[0]) && arc[1] == 0 && (59..=64).contains(&arc[3]));
         let red = image.get_pixel(30, 10);
-        assert!(
-            (126..=130).contains(&red[0]) && red[1] == 0 && (126..=130).contains(&red[3])
-        );
+        assert!((126..=130).contains(&red[0]) && red[1] == 0 && (126..=130).contains(&red[3]));
         for (x, y) in [(40, 40), (49, 49)] {
             let green = image.get_pixel(x, y);
             assert!(
-                green[0] == 0
-                    && (126..=130).contains(&green[1])
-                    && (126..=130).contains(&green[3])
+                green[0] == 0 && (126..=130).contains(&green[1]) && (126..=130).contains(&green[3])
             );
         }
     }
@@ -3177,5 +3211,204 @@ mod backdrop_blur_tests {
             "premultiplied alpha: {clipped:?}"
         );
         assert_eq!(*images[2].get_pixel(30, 30), image::Rgba([255, 0, 0, 255]));
+    }
+
+    #[test]
+    fn image_alpha_mask_matches_pixels_and_reuses_atlas_across_frames() {
+        // CPU reference adapted from zui gpui_macos at
+        // b564a34413bb7ef1da04121c4a287758f94993d9 (Apache-2.0).
+        fn mask_alpha(mask: ImageAlphaMaskParams, x: u32, y: u32) -> f32 {
+            if mask.feather <= 0. {
+                return 1.;
+            }
+            let smooth = |value: f32| {
+                let t = value.clamp(0., 1.);
+                t * t * (3. - 2. * t)
+            };
+            let half_width = mask.bounds.size.width.0 * 0.5;
+            let half_height = mask.bounds.size.height.0 * 0.5;
+            let x = x as f32 + 0.5;
+            let y = y as f32 + 0.5;
+            let qx = (x - mask.bounds.origin.x.0 - half_width).abs() - half_width + mask.radius;
+            let qy = (y - mask.bounds.origin.y.0 - half_height).abs() - half_height + mask.radius;
+            let distance = qx.max(0.).hypot(qy.max(0.)) + qx.max(qy).min(0.) - mask.radius;
+            let mut alpha = smooth((distance - mask.clearance) / mask.feather);
+            if mask.bottom_feather > 0. {
+                alpha = alpha.min(smooth((mask.bottom_y - y) / mask.bottom_feather));
+            }
+            alpha
+        }
+
+        let mut renderer = renderer();
+        renderer.opaque = false;
+        let tile_size = size(DevicePixels(64), DevicePixels(64));
+        let key = RenderImageParams {
+            image_id: ImageId(741),
+            frame_index: 0,
+        };
+        let tile = renderer
+            .sprite_atlas()
+            .get_or_insert_with(key.clone().into(), &mut || {
+                Ok(Some((
+                    tile_size,
+                    Cow::Owned([32u8, 96, 224, 160].repeat(64 * 64)),
+                )))
+            })
+            .unwrap()
+            .unwrap();
+        let sprite = |alpha_mask, fade| PolychromeSprite {
+            order: 1,
+            pad: 0,
+            tile,
+            grayscale: false.into(),
+            opacity: 0.75,
+            bounds: bounds(0., 0., 64., 64.),
+            content_mask: ContentMask {
+                bounds: bounds(0., 0., 64., 64.),
+            },
+            corner_radii: Corners::default(),
+            fade,
+            alpha_mask,
+        };
+        let mut paint = |alpha_mask, fade| {
+            let cached = renderer
+                .sprite_atlas()
+                .get_or_insert_with(key.clone().into(), &mut || {
+                    panic!("changing mask geometry must not reupload the image")
+                })
+                .unwrap()
+                .unwrap();
+            assert_eq!(cached, tile);
+            let mut scene = Scene::default();
+            scene.polychrome_sprites.push(sprite(alpha_mask, fade));
+            render(&mut renderer, &mut scene, 64, 64)
+        };
+
+        let plain = paint(Default::default(), Default::default());
+        let source = plain.get_pixel(5, 5);
+        assert!(
+            (118..=122).contains(&source[3]),
+            "source alpha and opacity: {source:?}"
+        );
+        assert!((102..=108).contains(&source[0]), "source red: {source:?}");
+        assert!((42..=48).contains(&source[1]), "source green: {source:?}");
+        assert!((12..=18).contains(&source[2]), "source blue: {source:?}");
+
+        let mask = ImageAlphaMaskParams {
+            bounds: bounds(18.25, 16.5, 23., 18.),
+            radius: 6.,
+            feather: 9.5,
+            clearance: 2.,
+            bottom_y: 55.,
+            bottom_feather: 8.,
+            pad: 0.,
+        };
+        let masks = [
+            mask,
+            ImageAlphaMaskParams {
+                bounds: bounds(8.5, 6.25, 36., 29.),
+                radius: 11.,
+                feather: 6.,
+                clearance: 0.,
+                bottom_y: 46.25,
+                bottom_feather: 13.,
+                pad: 0.,
+            },
+            ImageAlphaMaskParams {
+                bounds: bounds(34., 38., 14., 12.),
+                radius: 3.,
+                feather: 12.,
+                clearance: 1.5,
+                bottom_y: 0.,
+                bottom_feather: 0.,
+                pad: 0.,
+            },
+            ImageAlphaMaskParams {
+                feather: 0.,
+                bottom_y: 20.,
+                bottom_feather: 8.,
+                ..Default::default()
+            },
+            ImageAlphaMaskParams {
+                feather: -1.,
+                bottom_y: 20.,
+                bottom_feather: 8.,
+                ..Default::default()
+            },
+        ];
+        for fade in [
+            EdgeFadeParams::default(),
+            EdgeFadeParams {
+                left_x: 4.,
+                band_left: 26.,
+                clip: rounded_clip(),
+                ..Default::default()
+            },
+        ] {
+            let baseline = paint(Default::default(), fade);
+            for mask in masks {
+                let actual = paint(mask, fade);
+                for y in 0..64 {
+                    for x in 0..64 {
+                        let alpha = mask_alpha(mask, x, y);
+                        for channel in 0..4 {
+                            let expected = baseline.get_pixel(x, y)[channel] as f32 * alpha;
+                            let actual = actual.get_pixel(x, y)[channel] as f32;
+                            assert!(
+                                (actual - expected).abs() <= 2.,
+                                "pixel ({x}, {y}) channel {channel}: {actual} vs {expected}"
+                            );
+                        }
+                    }
+                }
+            }
+            assert_eq!(paint(Default::default(), fade), baseline);
+        }
+        drop(paint);
+
+        let mut shifted_images = Vec::new();
+        for alpha_mask in [ImageAlphaMaskParams::default(), mask] {
+            let mut shifted = sprite(alpha_mask, EdgeFadeParams::default());
+            shifted.bounds = bounds(8., 6., 48., 50.);
+            shifted.corner_radii = Corners::all(ScaledPixels(5.));
+            let mut scene = Scene::default();
+            scene.polychrome_sprites.push(shifted);
+            shifted_images.push(render(&mut renderer, &mut scene, 64, 64));
+        }
+        for y in 6..56 {
+            for x in 8..56 {
+                let alpha = mask_alpha(mask, x, y);
+                for channel in 0..4 {
+                    let baseline = shifted_images[0].get_pixel(x, y)[channel] as f32;
+                    let actual = shifted_images[1].get_pixel(x, y)[channel] as f32;
+                    assert!(
+                        (actual - baseline * alpha).abs() <= 2.,
+                        "shifted pixel ({x}, {y}) channel {channel}"
+                    );
+                }
+            }
+        }
+
+        let mut images = Vec::new();
+        for alpha_mask in [ImageAlphaMaskParams::default(), mask] {
+            let mut scene = Scene::default();
+            scene
+                .quads
+                .push(quad(0, bounds(0., 0., 64., 64.), 0x0000ffff));
+            scene
+                .polychrome_sprites
+                .push(sprite(alpha_mask, EdgeFadeParams::default()));
+            scene
+                .quads
+                .push(quad(2, bounds(48., 20., 4., 4.), 0xff0000ff));
+            images.push(render(&mut renderer, &mut scene, 64, 64));
+        }
+        assert_ne!(images[0].get_pixel(30, 30), &image::Rgba([0, 0, 255, 255]));
+        assert_eq!(*images[1].get_pixel(30, 30), image::Rgba([0, 0, 255, 255]));
+        assert_eq!(images[1].get_pixel(5, 30), images[0].get_pixel(5, 30));
+        let visible = images[1].get_pixel(5, 30);
+        assert!((100..=110).contains(&visible[0]) && (40..=50).contains(&visible[1]));
+        assert!((140..=160).contains(&visible[2]) && visible[3] == 255);
+        assert_eq!(*images[1].get_pixel(49, 21), image::Rgba([255, 0, 0, 255]));
     }
 }

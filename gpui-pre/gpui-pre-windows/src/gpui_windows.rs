@@ -45,8 +45,8 @@ pub(crate) use windows::Win32::Foundation::HWND;
 #[cfg(test)]
 mod tests {
     use gpui::{
-        BackdropBlur, EdgeFadeParams, MonochromeSprite, PolychromeSprite, Quad, RoundedClipParams,
-        Shadow, SubpixelSprite, Underline,
+        AtlasTile, BackdropBlur, EdgeFadeParams, ImageAlphaMaskParams, MonochromeSprite,
+        PolychromeSprite, Quad, RoundedClipParams, Shadow, SubpixelSprite, Underline,
     };
     use std::mem::{align_of, offset_of, size_of};
 
@@ -155,8 +155,18 @@ mod tests {
                 "EdgeFadeParams fade;",
             ],
         );
+        assert_eq!(size_of::<AtlasTile>(), 32);
+        assert_eq!(offset_of!(PolychromeSprite, order), 0);
+        assert_eq!(offset_of!(PolychromeSprite, pad), 4);
+        assert_eq!(offset_of!(PolychromeSprite, tile), 8);
+        assert_eq!(offset_of!(PolychromeSprite, grayscale), 40);
+        assert_eq!(offset_of!(PolychromeSprite, opacity), 44);
+        assert_eq!(offset_of!(PolychromeSprite, bounds), 48);
+        assert_eq!(offset_of!(PolychromeSprite, content_mask), 64);
+        assert_eq!(offset_of!(PolychromeSprite, corner_radii), 80);
         assert_eq!(offset_of!(PolychromeSprite, fade), 96);
-        assert_eq!(size_of::<PolychromeSprite>(), 160);
+        assert_eq!(offset_of!(PolychromeSprite, alpha_mask), 160);
+        assert_eq!(size_of::<PolychromeSprite>(), 200);
         assert_fields_in_order(
             hlsl_struct("PolychromeSprite"),
             &[
@@ -169,6 +179,7 @@ mod tests {
                 "Bounds content_mask;",
                 "Corners corner_radii;",
                 "EdgeFadeParams fade;",
+                "ImageAlphaMaskParams alpha_mask;",
             ],
         );
         assert_eq!(offset_of!(Shadow, clip), 112);
@@ -236,6 +247,31 @@ mod tests {
                 "float4 backdrop_source;",
                 "float4 backdrop_kernel;",
                 "float4 backdrop_weights[33];",
+            ],
+        );
+    }
+
+    #[test]
+    fn image_alpha_mask_hlsl_layout_matches_host() {
+        assert_eq!(align_of::<ImageAlphaMaskParams>(), align_of::<f32>());
+        assert_eq!(size_of::<ImageAlphaMaskParams>(), 40);
+        assert_eq!(offset_of!(ImageAlphaMaskParams, bounds), 0);
+        assert_eq!(offset_of!(ImageAlphaMaskParams, radius), 16);
+        assert_eq!(offset_of!(ImageAlphaMaskParams, feather), 20);
+        assert_eq!(offset_of!(ImageAlphaMaskParams, clearance), 24);
+        assert_eq!(offset_of!(ImageAlphaMaskParams, bottom_y), 28);
+        assert_eq!(offset_of!(ImageAlphaMaskParams, bottom_feather), 32);
+        assert_eq!(offset_of!(ImageAlphaMaskParams, pad), 36);
+        assert_fields_in_order(
+            hlsl_struct("ImageAlphaMaskParams"),
+            &[
+                "Bounds bounds;",
+                "float radius;",
+                "float feather;",
+                "float clearance;",
+                "float bottom_y;",
+                "float bottom_feather;",
+                "float pad;",
             ],
         );
     }

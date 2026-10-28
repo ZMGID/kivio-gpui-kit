@@ -795,6 +795,23 @@ impl From<SubpixelSprite> for Primitive {
     }
 }
 
+/// Device-pixel image exclusion parameters. Zero feather disables the mask.
+///
+/// Adapted from zui `crates/gpui/src/scene.rs` at
+/// b564a34413bb7ef1da04121c4a287758f94993d9 (Apache-2.0).
+#[derive(Default, Copy, Clone, Debug, PartialEq)]
+#[repr(C)]
+#[expect(missing_docs)]
+pub struct ImageAlphaMaskParams {
+    pub bounds: Bounds<ScaledPixels>,
+    pub radius: f32,
+    pub feather: f32,
+    pub clearance: f32,
+    pub bottom_y: f32,
+    pub bottom_feather: f32,
+    pub pad: f32,
+}
+
 #[derive(Copy, Clone, Debug)]
 #[repr(C)]
 #[expect(missing_docs)]
@@ -808,6 +825,7 @@ pub struct PolychromeSprite {
     pub content_mask: ContentMask<ScaledPixels>,
     pub corner_radii: Corners<ScaledPixels>,
     pub fade: EdgeFadeParams,
+    pub alpha_mask: ImageAlphaMaskParams,
 }
 
 impl From<PolychromeSprite> for Primitive {

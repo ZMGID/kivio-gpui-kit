@@ -1325,6 +1325,33 @@ fn fs_mono_sprite(input: MonoSpriteVarying) -> @location(0) vec4<f32> {
 
 // --- polychrome sprites --- //
 
+// Adapted from zui crates/gpui_wgpu/src/shaders.wgsl at
+// b564a34413bb7ef1da04121c4a287758f94993d9 (Apache-2.0).
+struct ImageAlphaMaskParams {
+    bounds: Bounds,
+    radius: f32,
+    feather: f32,
+    clearance: f32,
+    bottom_y: f32,
+    bottom_feather: f32,
+    pad: f32,
+}
+
+fn image_mask_alpha(position: vec2<f32>, mask: ImageAlphaMaskParams) -> f32 {
+    if (mask.feather <= 0.0) {
+        return 1.0;
+    }
+    let half_size = mask.bounds.size * 0.5;
+    let center = mask.bounds.origin + half_size;
+    let q = abs(position - center) - half_size + vec2<f32>(mask.radius);
+    let distance = length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - mask.radius;
+    var alpha = smoothstep(0.0, mask.feather, distance - mask.clearance);
+    if (mask.bottom_feather > 0.0) {
+        alpha = min(alpha, smoothstep(0.0, mask.bottom_feather, mask.bottom_y - position.y));
+    }
+    return alpha;
+}
+
 struct PolychromeSprite {
     order: u32,
     pad: u32,
@@ -1335,6 +1362,7 @@ struct PolychromeSprite {
     content_mask: Bounds,
     corner_radii: Corners,
     fade: EdgeFadeParams,
+    alpha_mask: ImageAlphaMaskParams,
 }
 
 
@@ -1374,7 +1402,8 @@ fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
         let grayscale = dot(color.rgb, GRAYSCALE_FACTORS);
         color = vec4<f32>(vec3<f32>(grayscale), sample.a);
     }
-    return blend_color(color, sprite.opacity * saturate(0.5 - distance) * edge_fade_alpha(input.position.xy, sprite.fade));
+    return blend_color(color, sprite.opacity * saturate(0.5 - distance) *
+        edge_fade_alpha(input.position.xy, sprite.fade) * image_mask_alpha(input.position.xy, sprite.alpha_mask));
 }
 
 // --- surfaces --- //

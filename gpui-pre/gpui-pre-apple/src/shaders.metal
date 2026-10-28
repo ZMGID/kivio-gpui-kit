@@ -748,6 +748,23 @@ vertex PolychromeSpriteVertexOutput polychrome_sprite_vertex(
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
 }
 
+// Image exclusion adapted from zui `crates/gpui_macos/src/shaders.metal`
+// at b564a34413bb7ef1da04121c4a287758f94993d9 (Apache-2.0).
+float image_mask_alpha(float2 position, ImageAlphaMaskParams mask) {
+  if (mask.feather <= 0.0) {
+    return 1.0;
+  }
+  float2 half_size = float2(mask.bounds.size.width, mask.bounds.size.height) * 0.5;
+  float2 center = float2(mask.bounds.origin.x, mask.bounds.origin.y) + half_size;
+  float2 q = abs(position - center) - half_size + mask.radius;
+  float distance = length(max(q, float2(0.0))) + min(max(q.x, q.y), 0.0) - mask.radius;
+  float alpha = smoothstep(0.0, mask.feather, distance - mask.clearance);
+  if (mask.bottom_feather > 0.0) {
+    alpha = min(alpha, smoothstep(0.0, mask.bottom_feather, mask.bottom_y - position.y));
+  }
+  return alpha;
+}
+
 fragment float4 polychrome_sprite_fragment(
     PolychromeSpriteFragmentInput input [[stage_in]],
     constant PolychromeSprite *sprites [[buffer(SpriteInputIndex_Sprites)]],
@@ -767,7 +784,9 @@ fragment float4 polychrome_sprite_fragment(
     color.g = grayscale;
     color.b = grayscale;
   }
-  color.a *= sprite.opacity * saturate(0.5 - distance) * edge_fade_alpha(input.position.xy, sprite.fade);
+  color.a *= sprite.opacity * saturate(0.5 - distance) *
+             edge_fade_alpha(input.position.xy, sprite.fade) *
+             image_mask_alpha(input.position.xy, sprite.alpha_mask);
   return color;
 }
 

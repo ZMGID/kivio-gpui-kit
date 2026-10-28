@@ -4990,6 +4990,8 @@ impl Window {
                 content_mask,
                 tile,
                 opacity,
+                fade: Default::default(),
+                alpha_mask: Default::default(),
             });
         }
         Ok(())
@@ -5162,6 +5164,8 @@ impl Window {
             corner_radii,
             tile: sub_tile,
             opacity,
+            fade: Default::default(),
+            alpha_mask: Default::default(),
         });
         Ok(())
     }

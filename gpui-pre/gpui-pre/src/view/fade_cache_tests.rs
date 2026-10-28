@@ -474,7 +474,10 @@ fn cached_child_updates_when_outer_paint_only_clip_changes(cx: &mut TestAppConte
     assert_eq!(renders.get(), initial + 1);
 
     outer.set(empty);
-    assert!(draw(cx).0.is_none(), "an empty outer clip must hide the cached child");
+    assert!(
+        draw(cx).0.is_none(),
+        "an empty outer clip must hide the cached child"
+    );
     assert_eq!(renders.get(), initial + 2);
 
     outer.set(full);

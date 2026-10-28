@@ -37,6 +37,8 @@ struct WgpuAtlasTextures {
     storage: WgpuAtlasStorage,
     pending_uploads: Vec<PendingUpload>,
     next_texture_generation: u64,
+    #[cfg(test)]
+    upload_count: usize,
 }
 
 pub struct WgpuTextureInfo {
@@ -60,6 +62,8 @@ impl WgpuAtlas {
             storage: WgpuAtlasStorage::default(),
             pending_uploads: Vec::new(),
             next_texture_generation: 0,
+            #[cfg(test)]
+            upload_count: 0,
         })))
     }
 
@@ -74,6 +78,11 @@ impl WgpuAtlas {
     pub fn before_frame(&self) {
         let mut lock = self.0.lock();
         lock.backend.flush_uploads();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn upload_count(&self) -> usize {
+        self.0.lock().backend.upload_count
     }
 
     /// Returns the view backing `id`, or `None` once every tile in it has been
@@ -300,6 +309,10 @@ impl WgpuAtlasTextures {
                     depth_or_array_layers: 1,
                 },
             );
+            #[cfg(test)]
+            {
+                self.upload_count += 1;
+            }
         }
     }
 }

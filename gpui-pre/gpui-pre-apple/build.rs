@@ -55,6 +55,7 @@ mod apple_build {
             "BackdropBlur".into(),
             "RoundedClipParams".into(),
             "EdgeFadeParams".into(),
+            "ImageAlphaMaskParams".into(),
             "QuadInputIndex".into(),
             "Underline".into(),
             "UnderlineInputIndex".into(),

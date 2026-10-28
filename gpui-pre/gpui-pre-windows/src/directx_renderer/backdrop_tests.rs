@@ -1109,6 +1109,7 @@ fn warp_translucent_sprites_keep_backdrop_at_scaled_edges() -> Result<()> {
                     content_mask,
                     corner_radii: Corners::all(ScaledPixels(2. * scale)),
                     fade: EdgeFadeParams::default(),
+                    alpha_mask: ImageAlphaMaskParams::default(),
                     tile,
                 });
             }
@@ -1245,6 +1246,7 @@ fn warp_edge_fade_applies_once_after_border_composition_and_to_sprites() -> Resu
                 content_mask,
                 corner_radii: Corners::default(),
                 fade: EdgeFadeParams::default(),
+                alpha_mask: ImageAlphaMaskParams::default(),
             });
         }
         assert_fade_ramp(&mut renderer, &mut scene, |scene, fade| {
@@ -1598,6 +1600,7 @@ fn warp_rounded_clip_applies_to_glyphs_subpixel_and_images() -> Result<()> {
                 content_mask,
                 corner_radii: Corners::default(),
                 fade,
+                alpha_mask: ImageAlphaMaskParams::default(),
             }),
         }
         let appearance = if kind == 1 {
@@ -1736,7 +1739,15 @@ fn warp_fractional_rounded_path_clip_keeps_conservative_mask_coverage() -> Resul
         scene.paths[0].clip = clip;
         renderer.render(&scene, WindowBackgroundAppearance::Transparent)?;
         let actual = pixels(&renderer)?;
-        for (x, y) in [(8, 16), (24, 6), (10, 9), (8, 8), (38, 20), (24, 36), (24, 20)] {
+        for (x, y) in [
+            (8, 16),
+            (24, 6),
+            (10, 9),
+            (8, 8),
+            (38, 20),
+            (24, 36),
+            (24, 20),
+        ] {
             let index = y * 64 + x;
             let coverage = rounded_clip_coverage(clip, x, y);
             assert!(
@@ -1878,4 +1889,227 @@ fn path_sprite_clip_layout_matches_hlsl() {
     assert_eq!(std::mem::size_of::<PathRasterizationSprite>(), 104);
     assert_eq!(std::mem::offset_of!(PathSprite, clip), 16);
     assert_eq!(std::mem::size_of::<PathSprite>(), 48);
+}
+
+fn image_mask_coverage(mask: ImageAlphaMaskParams, x: usize, y: usize) -> f32 {
+    if mask.feather <= 0. {
+        return 1.;
+    }
+    let half_x = mask.bounds.size.width.0 * 0.5;
+    let half_y = mask.bounds.size.height.0 * 0.5;
+    let dx = (x as f32 + 0.5 - mask.bounds.origin.x.0 - half_x).abs();
+    let dy = (y as f32 + 0.5 - mask.bounds.origin.y.0 - half_y).abs();
+    let qx = dx - half_x + mask.radius;
+    let qy = dy - half_y + mask.radius;
+    let distance = qx.max(0.).hypot(qy.max(0.)) + qx.max(qy).min(0.) - mask.radius;
+    let smooth = |value: f32, width: f32| {
+        let t = (value / width).clamp(0., 1.);
+        t * t * (3. - 2. * t)
+    };
+    let alpha = smooth(distance - mask.clearance, mask.feather);
+    if mask.bottom_feather > 0. {
+        alpha.min(smooth(
+            mask.bottom_y - (y as f32 + 0.5),
+            mask.bottom_feather,
+        ))
+    } else {
+        alpha
+    }
+}
+
+#[::core::prelude::v1::test]
+fn warp_image_alpha_mask_composes_and_reuses_atlas_tile() -> Result<()> {
+    let (mut renderer, _window) = warp_renderer()?;
+    let tile_size = size(DevicePixels(64), DevicePixels(64));
+    let key = AtlasKey::Image(RenderImageParams {
+        image_id: ImageId(1004),
+        frame_index: 0,
+    });
+    let bytes: Vec<u8> = (0..64)
+        .flat_map(|_| {
+            (0..64).flat_map(|x| {
+                let alpha = if (16..20).contains(&x) {
+                    0
+                } else if x < 32 {
+                    64
+                } else {
+                    192
+                };
+                [40, 90, 180, alpha]
+            })
+        })
+        .collect();
+    let mut uploads = 0;
+    let tile = renderer
+        .atlas
+        .get_or_insert_with(key.clone(), &mut || {
+            uploads += 1;
+            Ok(Some((tile_size, std::borrow::Cow::Borrowed(&bytes))))
+        })?
+        .unwrap();
+    let mut scene = Scene::default();
+    scene.polychrome_sprites.push(PolychromeSprite {
+        order: 1,
+        pad: 0,
+        tile,
+        grayscale: false.into(),
+        opacity: 0.65,
+        bounds: bounds(0., 0., 64., 64.),
+        content_mask: ContentMask {
+            bounds: bounds(0., 0., 64., 64.),
+        },
+        corner_radii: Corners::default(),
+        fade: EdgeFadeParams {
+            top_y: 0.,
+            band_top: 16.,
+            clip: rounded_clip_fixture(1.),
+            ..Default::default()
+        },
+        alpha_mask: ImageAlphaMaskParams::default(),
+    });
+    renderer.render(&scene, WindowBackgroundAppearance::Transparent)?;
+    let reference = pixels(&renderer)?;
+    let left_alpha = reference[32 * 64 + 12][3] as i32;
+    let right_alpha = reference[32 * 64 + 52][3] as i32;
+    assert!(left_alpha > 30 && (3 * left_alpha - right_alpha).abs() <= 3);
+    assert_eq!(reference[32 * 64 + 17][3], 0);
+
+    let mask = ImageAlphaMaskParams {
+        bounds: bounds(24.25, 18.25, 16.5, 23.5),
+        radius: 6.,
+        feather: 16.,
+        clearance: 2.25,
+        bottom_y: 58.25,
+        bottom_feather: 12.5,
+        pad: 0.,
+    };
+    let moved = ImageAlphaMaskParams {
+        bounds: bounds(15.75, 18.25, 16.5, 23.5),
+        ..mask
+    };
+    let no_bottom = ImageAlphaMaskParams {
+        bottom_feather: 0.,
+        ..mask
+    };
+    let mut frames = Vec::new();
+    for (frame, params) in [mask, moved, no_bottom].into_iter().enumerate() {
+        let reused = renderer
+            .atlas
+            .get_or_insert_with(key.clone(), &mut || {
+                uploads += 1;
+                Ok(Some((tile_size, std::borrow::Cow::Borrowed(&bytes))))
+            })?
+            .unwrap();
+        assert_eq!(reused, tile);
+        assert_eq!(uploads, 1, "animated masks must not re-upload the image");
+        scene.polychrome_sprites[0].tile = reused;
+        scene.polychrome_sprites[0].alpha_mask = params;
+        renderer.render(&scene, WindowBackgroundAppearance::Transparent)?;
+        let actual = pixels(&renderer)?;
+        let mut samples = [false; 5];
+        for y in 0..64 {
+            for x in 0..64 {
+                let index = y * 64 + x;
+                let coverage = image_mask_coverage(params, x, y);
+                if reference[index][3] > 4 {
+                    if coverage == 0. {
+                        samples[0] = true;
+                    } else if coverage < 0.9 {
+                        samples[1] = true;
+                    } else if coverage > 0.99 {
+                        samples[2] = true;
+                    }
+                    if frame == 0 {
+                        let no_bottom_coverage = image_mask_coverage(no_bottom, x, y);
+                        if coverage > 0.1
+                            && coverage < 0.9
+                            && no_bottom_coverage < 0.95
+                            && no_bottom_coverage > coverage + 0.1
+                        {
+                            samples[3] = true;
+                        }
+                        let clip = rounded_clip_coverage(rounded_clip_fixture(1.), x, y);
+                        if y < 16 && clip > 0.1 && clip < 0.9 && coverage > 0.1 && coverage < 0.9 {
+                            samples[4] = true;
+                        }
+                    }
+                }
+                for channel in 0..4 {
+                    let expected = reference[index][channel] as f32 * coverage;
+                    assert!(
+                        (actual[index][channel] as f32 - expected).abs() <= 3.,
+                        "frame {frame} pixel ({x},{y}) channel {channel}, coverage {coverage}: {:?} vs {:?}",
+                        actual[index],
+                        reference[index]
+                    );
+                }
+            }
+        }
+        if frame == 0 {
+            assert_eq!(
+                samples, [true; 5],
+                "fixture must exercise exclusion, feather, bottom minimum and fade/clip overlap"
+            );
+        }
+        frames.push(actual);
+    }
+    assert!(frames[1][32 * 64 + 38][3] > frames[0][32 * 64 + 38][3] + 10);
+    assert!(frames[2][53 * 64 + 45][3] > frames[0][53 * 64 + 45][3] + 20);
+
+    for feather in [0., -1.] {
+        scene.polychrome_sprites[0].alpha_mask = ImageAlphaMaskParams { feather, ..mask };
+        renderer.render(&scene, WindowBackgroundAppearance::Transparent)?;
+        assert_pixels(&pixels(&renderer)?, &reference, 0);
+    }
+
+    scene.polychrome_sprites[0].grayscale = true.into();
+    scene.polychrome_sprites[0].alpha_mask = ImageAlphaMaskParams::default();
+    renderer.render(&scene, WindowBackgroundAppearance::Transparent)?;
+    let grayscale = pixels(&renderer)?;
+    let gray_pixel = grayscale[32 * 64 + 52];
+    assert_eq!(gray_pixel[0], gray_pixel[1]);
+    assert_eq!(gray_pixel[1], gray_pixel[2]);
+    scene.polychrome_sprites[0].alpha_mask = mask;
+    renderer.render(&scene, WindowBackgroundAppearance::Transparent)?;
+    let masked_grayscale = pixels(&renderer)?;
+    for (x, y) in [(32, 8), (20, 32), (45, 53), (50, 16)] {
+        let index = y * 64 + x;
+        assert_eq!(grayscale[index][3], reference[index][3]);
+        let coverage = image_mask_coverage(mask, x, y);
+        for channel in 0..4 {
+            assert!(
+                (masked_grayscale[index][channel] as f32
+                    - grayscale[index][channel] as f32 * coverage)
+                    .abs()
+                    <= 3.
+            );
+        }
+    }
+    scene.polychrome_sprites[0].grayscale = false.into();
+
+    scene.polychrome_sprites[0].alpha_mask = mask;
+    scene
+        .quads
+        .push(quad(0, bounds(0., 0., 64., 64.), hsla(0., 0., 0.25, 0.8)));
+    renderer.render(&scene, WindowBackgroundAppearance::Transparent)?;
+    let over_background = pixels(&renderer)?;
+    for (source, actual) in frames[0].iter().zip(&over_background) {
+        let remaining = 1. - source[3] as f32 / 255.;
+        for channel in 0..4 {
+            let background = if channel == 3 { 204. } else { 51. };
+            let expected = source[channel] as f32 + background * remaining;
+            assert!(
+                (actual[channel] as f32 - expected).abs() <= 3.,
+                "masked image must source-over its backdrop: {source:?} -> {actual:?}"
+            );
+        }
+    }
+    scene.quads.push(quad(
+        2,
+        bounds(44., 28., 8., 8.),
+        hsla(1. / 3., 1., 0.5, 1.),
+    ));
+    renderer.render(&scene, WindowBackgroundAppearance::Transparent)?;
+    assert_eq!(pixels(&renderer)?[32 * 64 + 48], [0, 255, 0, 255]);
+    Ok(())
 }

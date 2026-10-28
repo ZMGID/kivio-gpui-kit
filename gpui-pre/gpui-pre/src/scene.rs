@@ -17,6 +17,8 @@ use std::{
 
 #[cfg(test)]
 mod backdrop_tests;
+#[cfg(test)]
+mod image_alpha_mask_tests;
 
 #[allow(non_camel_case_types, unused)]
 #[expect(missing_docs)]
@@ -917,12 +919,80 @@ pub struct PolychromeSprite {
     pub content_mask: ContentMask<ScaledPixels>,
     pub corner_radii: Corners<ScaledPixels>,
     pub fade: EdgeFadeParams,
+    pub alpha_mask: ImageAlphaMaskParams,
 }
 
 impl From<PolychromeSprite> for Primitive {
     fn from(sprite: PolychromeSprite) -> Self {
         Primitive::PolychromeSprite(sprite)
     }
+}
+
+/// A window-space rounded rectangle excluded from an image with a soft edge.
+///
+/// The optional bottom fade combines with the exclusion without modifying the
+/// source image or its atlas entry. A nonpositive feather disables the mask.
+///
+/// Adapted from zui `crates/gpui/src/scene.rs` at
+/// b564a34413bb7ef1da04121c4a287758f94993d9 (Apache-2.0).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ImageAlphaMask {
+    /// Rectangle to exclude, in logical window pixels.
+    pub bounds: Bounds<Pixels>,
+    /// Corner radius, clamped to half the shorter side.
+    pub radius: Pixels,
+    /// Width of the soft transition outside the exclusion.
+    pub feather: Pixels,
+    /// Additional transparent distance outside the exclusion.
+    pub clearance: Pixels,
+    /// Optional bottom edge and its transition width, in logical window pixels.
+    pub bottom_fade: Option<(Pixels, Pixels)>,
+}
+
+impl ImageAlphaMask {
+    /// Creates a mask with no extra clearance or bottom fade.
+    pub fn new(bounds: Bounds<Pixels>, radius: Pixels, feather: Pixels) -> Self {
+        Self {
+            bounds,
+            radius,
+            feather,
+            clearance: Pixels::ZERO,
+            bottom_fade: None,
+        }
+    }
+
+    pub(crate) fn scale(self, factor: f32) -> ImageAlphaMaskParams {
+        let (bottom_y, bottom_feather) = self.bottom_fade.unwrap_or_default();
+        ImageAlphaMaskParams {
+            bounds: self.bounds.scale(factor),
+            radius: self
+                .radius
+                .0
+                .max(0.)
+                .min(self.bounds.size.width.0.max(0.) * 0.5)
+                .min(self.bounds.size.height.0.max(0.) * 0.5)
+                * factor,
+            feather: self.feather.0.max(0.) * factor,
+            clearance: self.clearance.0.max(0.) * factor,
+            bottom_y: bottom_y.0 * factor,
+            bottom_feather: bottom_feather.0.max(0.) * factor,
+            pad: 0.,
+        }
+    }
+}
+
+/// Shader parameters for [`ImageAlphaMask`] in device pixels.
+#[derive(Default, Copy, Clone, Debug, PartialEq)]
+#[repr(C)]
+#[expect(missing_docs)]
+pub struct ImageAlphaMaskParams {
+    pub bounds: Bounds<ScaledPixels>,
+    pub radius: f32,
+    pub feather: f32,
+    pub clearance: f32,
+    pub bottom_y: f32,
+    pub bottom_feather: f32,
+    pub pad: f32,
 }
 
 #[derive(Clone, Debug)]

@@ -2767,14 +2767,17 @@ impl gpui::PlatformHeadlessRenderer for WgpuHeadlessRenderer {
     }
 }
 
-fn split_path_batch(paths: &[Path<ScaledPixels>]) -> (&[Path<ScaledPixels>], &[Path<ScaledPixels>]) {
+fn split_path_batch(
+    paths: &[Path<ScaledPixels>],
+) -> (&[Path<ScaledPixels>], &[Path<ScaledPixels>]) {
     if paths.is_empty() {
         return paths.split_at(0);
     }
     let end = if paths[0].clip.right > paths[0].clip.left {
         1
     } else {
-        paths.iter()
+        paths
+            .iter()
             .position(|path| path.clip.right > path.clip.left)
             .unwrap_or(paths.len())
     };
@@ -3156,6 +3159,17 @@ mod tests {
                 );
             }
             check_layout!(
+                "ImageAlphaMaskParams",
+                gpui::ImageAlphaMaskParams,
+                bounds,
+                radius,
+                feather,
+                clearance,
+                bottom_y,
+                bottom_feather,
+                pad,
+            );
+            check_layout!(
                 "PolychromeSprite",
                 PolychromeSprite,
                 order,
@@ -3167,6 +3181,7 @@ mod tests {
                 content_mask,
                 corner_radii,
                 fade,
+                alpha_mask,
             );
             check_layout!("SurfaceParams", SurfaceParams, bounds, content_mask, clip);
             assert_eq!(
@@ -3235,7 +3250,36 @@ mod tests {
         assert_eq!(std::mem::size_of::<Underline>(), 24 * 4);
         assert_eq!(std::mem::size_of::<MonochromeSprite>(), 44 * 4);
         assert_eq!(std::mem::size_of::<SubpixelSprite>(), 44 * 4);
-        assert_eq!(std::mem::size_of::<PolychromeSprite>(), 40 * 4);
+        assert_eq!(std::mem::size_of::<gpui::ImageAlphaMaskParams>(), 10 * 4);
+        assert_eq!(std::mem::size_of::<PolychromeSprite>(), 50 * 4);
+    }
+
+    #[test]
+    fn image_mask_words_match_webgl_decoder() {
+        let mask = gpui::ImageAlphaMaskParams {
+            bounds: Bounds {
+                origin: Point {
+                    x: 1.0.into(),
+                    y: 2.0.into(),
+                },
+                size: Size {
+                    width: 3.0.into(),
+                    height: 4.0.into(),
+                },
+            },
+            radius: 5.0,
+            feather: 6.0,
+            clearance: 7.0,
+            bottom_y: 8.0,
+            bottom_feather: 9.0,
+            pad: 10.0,
+        };
+        let bytes = unsafe { WgpuRendererCore::instance_bytes(std::slice::from_ref(&mask)) };
+        let words: &[u32] = bytemuck::cast_slice(bytes);
+        assert_eq!(
+            words,
+            &[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0].map(f32::to_bits)
+        );
     }
 
     #[test]

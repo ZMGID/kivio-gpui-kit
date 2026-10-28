@@ -86,6 +86,11 @@ impl PlatformAtlas for DirectXAtlas {
     fn remove(&self, key: &AtlasKey) {
         self.0.lock().remove(key);
     }
+
+    #[cfg(feature = "test-support")]
+    fn contains(&self, key: &AtlasKey) -> bool {
+        self.0.lock().contains(key)
+    }
 }
 
 impl AtlasBackend for DirectXAtlasTextures {
@@ -411,8 +416,12 @@ mod tests {
         let keeper_tile = insert_tile(&atlas, keeper_key, small);
         let tile_a = insert_tile(&atlas, big_key_a.clone(), big);
         assert_eq!(keeper_tile.texture_id, tile_a.texture_id);
+        #[cfg(feature = "test-support")]
+        assert!(atlas.contains(&big_key_a));
 
         atlas.remove(&big_key_a);
+        #[cfg(feature = "test-support")]
+        assert!(!atlas.contains(&big_key_a));
 
         let tile_b = insert_tile(&atlas, big_key_b, big);
         assert_eq!(tile_b.texture_id, keeper_tile.texture_id);

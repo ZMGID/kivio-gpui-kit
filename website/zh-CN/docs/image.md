@@ -111,7 +111,7 @@ svg()
 
 解码后的图片会被保留，再次绘制同一来源时不必重新加载。由哪个缓存保留，决定了图片何时被释放。
 
-- **默认缓存。** `Resource` 来源（URL、资源键或路径）的 `img()` 使用 App 的资源缓存，按来源作为键。一个条目供所有窗口和视图共用，直到用 `ImageSource::remove_asset(cx)` 删除为止。加载失败的结果也会被缓存，所以重试同一来源前要先删除这个条目。`Arc<Image>` 也以同样的方式缓存。
+- **默认缓存。** `Resource` 来源（URL、资源键或路径）的 `img()` 使用 App 的资源缓存，按来源作为键。一个条目供所有窗口和视图共用。对于 `ImageSource`，在窗口更新期间调用 `source.evict(Some(window), cx)`，或在窗口更新之外调用 `source.evict(None, cx)`，可以删除缓存条目，并从所有窗口的精灵图集中释放解码后图片的图块。正在加载的任务会被取消，失败的结果也会被删除，再次绘制时可以重试。淘汰本身不会重绘视图，也不会通知已取消加载任务的订阅者。`Arc<Image>` 也使用同样的缓存。对于已解码的 `Render` 来源，淘汰只释放图集图块，不会丢弃图片；之后绘制时可以重新上传。淘汰不会清除限定范围的缓存，也不会调用自定义加载器。`source.remove_asset(cx)` 只删除资源缓存条目，不会释放图集图块。
 - **限定范围的缓存。** `image_cache(provider)` 包裹子元素，其中的 `img()` 改用这个缓存。`image_cache(retain_all("preview"))` 在元素状态里保存一个 `RetainAllImageCache`：它保留加载过的所有图片，元素不再绘制时一并释放。`img(...).image_cache(&cache)` 为单张图片指定缓存。
 - **自定义缓存。** 实现 `ImageCache` 来决定保留哪些图片。`ImageCacheItem::new(resource, cx)` 通过 GPUI 的图片加载器开始加载，`item.use_image(window)` 返回结果，并在加载完成时重绘当前视图。淘汰图片时，用 `cx.drop_image(image, Some(window))` 释放它的 GPU 纹理。
 

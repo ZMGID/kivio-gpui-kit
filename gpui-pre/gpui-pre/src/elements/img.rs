@@ -584,6 +584,31 @@ impl ImageSource {
         }
     }
 
+    /// Evicts this source from the default asset cache and removes the decoded
+    /// image's sprite-atlas tiles from all windows. Pending loads are cancelled.
+    ///
+    /// Pass the window currently being updated, if any, because it is not in the
+    /// app's window list during its update. `Render` sources only lose their
+    /// atlas tiles; custom loaders and independently managed image caches are
+    /// unaffected. This does not schedule a redraw or notify subscribers of a
+    /// cancelled load. Drawing the source again can load or upload it again.
+    pub fn evict(&self, window: Option<&mut Window>, cx: &mut App) {
+        let render_image = match self {
+            ImageSource::Resource(resource) => cx
+                .peek_asset::<ImgResourceLoader>(resource)
+                .and_then(Result::ok),
+            ImageSource::Image(data) => cx
+                .peek_asset::<AssetLogger<ImageDecoder>>(data)
+                .and_then(Result::ok),
+            ImageSource::Render(data) => Some(data.clone()),
+            ImageSource::Custom(_) => None,
+        };
+        self.remove_asset(cx);
+        if let Some(image) = render_image {
+            cx.drop_image(image, window);
+        }
+    }
+
     /// Check whether this image source is present in the asset system (loading
     /// or loaded), without fetching it.
     #[cfg(any(test, feature = "test-support"))]
@@ -802,8 +827,12 @@ impl From<image::ImageError> for ImageCacheError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ParentElement as _, TestAppContext, canvas, div, point, px, size};
+    use crate::{
+        AppContext as _, ParentElement as _, RenderImageParams, TestAppContext, VisualTestContext,
+        canvas, div, point, px, size,
+    };
     use image::{Frame, ImageBuffer, Rgba};
+    use std::{cell::Cell, rc::Rc};
 
     const TEST_IMG_ID: &str = "test-img";
 
@@ -817,6 +846,96 @@ mod tests {
     fn test_image_with_size(width: u32, height: u32) -> Arc<RenderImage> {
         let frame = Frame::new(ImageBuffer::from_pixel(width, height, Rgba([0, 0, 0, 0])));
         Arc::new(RenderImage::new(SmallVec::from_elem(frame, 1)))
+    }
+
+    fn test_sources() -> [ImageSource; 2] {
+        let path = PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/examples/image/exif-orientation-rotate-180.jpg"
+        ));
+        let image = Image::from_bytes(
+            crate::ImageFormat::Jpeg,
+            include_bytes!("../../examples/image/exif-orientation-rotate-180.jpg").to_vec(),
+        );
+        [ImageSource::from(path), ImageSource::Image(Arc::new(image))]
+    }
+
+    fn fetch_test_source(
+        source: &ImageSource,
+        cx: &mut App,
+    ) -> Option<Result<Arc<RenderImage>, ImageCacheError>> {
+        match source {
+            ImageSource::Resource(resource) => cx.fetch_asset::<ImgResourceLoader>(resource),
+            ImageSource::Image(data) => cx.fetch_asset::<AssetLogger<ImageDecoder>>(data),
+            _ => unreachable!(),
+        }
+    }
+
+    fn peek_test_source(
+        source: &ImageSource,
+        cx: &App,
+    ) -> Option<Result<Arc<RenderImage>, ImageCacheError>> {
+        match source {
+            ImageSource::Resource(resource) => cx.peek_asset::<ImgResourceLoader>(resource),
+            ImageSource::Image(data) => cx.peek_asset::<AssetLogger<ImageDecoder>>(data),
+            _ => unreachable!(),
+        }
+    }
+
+    fn test_windows(cx: &mut TestAppContext) -> (VisualTestContext, VisualTestContext) {
+        let first = cx.add_window(|_, _| crate::Empty);
+        let second = cx.add_window(|_, _| crate::Empty);
+        cx.run_until_parked();
+        (
+            VisualTestContext::from_window(first.into(), cx),
+            VisualTestContext::from_window(second.into(), cx),
+        )
+    }
+
+    fn paint_frames(window: &mut VisualTestContext, image: &Arc<RenderImage>) {
+        let image = image.clone();
+        window.draw(
+            point(px(0.), px(0.)),
+            size(px(10.), px(10.)),
+            move |_, _| {
+                canvas(
+                    |_, _, _| (),
+                    move |bounds, _, window, _| {
+                        for frame_index in 0..image.frame_count() {
+                            window
+                                .paint_image(
+                                    bounds,
+                                    bounds,
+                                    Default::default(),
+                                    image.clone(),
+                                    frame_index,
+                                    false,
+                                )
+                                .expect("image frame should paint");
+                        }
+                    },
+                )
+                .size_full()
+            },
+        );
+    }
+
+    fn frame_is_cached(window: &Window, image: &RenderImage, frame_index: usize) -> bool {
+        window.platform_window.sprite_atlas().contains(
+            &RenderImageParams {
+                image_id: image.id,
+                frame_index,
+            }
+            .into(),
+        )
+    }
+
+    fn assert_frames_cached(window: &mut VisualTestContext, image: &RenderImage, expected: bool) {
+        window.update(|window, _| {
+            for frame_index in 0..image.frame_count() {
+                assert_eq!(frame_is_cached(window, image, frame_index), expected);
+            }
+        });
     }
 
     /// Overwrites the cached `frame_index` of the sibling `img` during paint.
@@ -833,6 +952,205 @@ mod tests {
                 });
             },
         )
+    }
+
+    #[gpui::test]
+    fn evict_loaded_sources_releases_cache_and_window_atlases(cx: &mut TestAppContext) {
+        let (mut first, mut second) = test_windows(cx);
+        let unrelated = test_image(1);
+        paint_frames(&mut first, &unrelated);
+        paint_frames(&mut second, &unrelated);
+
+        for source in test_sources() {
+            first.cx.update(|cx| {
+                assert!(!source.is_asset_cached(cx));
+                assert!(peek_test_source(&source, cx).is_none());
+                source.evict(None, cx);
+                assert!(!source.is_asset_cached(cx));
+                assert!(fetch_test_source(&source, cx).is_none());
+                assert!(source.is_asset_cached(cx));
+                assert!(peek_test_source(&source, cx).is_none());
+            });
+            first.run_until_parked();
+            let image = first
+                .cx
+                .read(|cx| peek_test_source(&source, cx).unwrap().unwrap());
+
+            paint_frames(&mut first, &image);
+            paint_frames(&mut second, &image);
+            assert_frames_cached(&mut first, &image, true);
+            assert_frames_cached(&mut second, &image, true);
+
+            first.update(|window, cx| {
+                source.evict(Some(window), cx);
+                assert!(!source.is_asset_cached(cx));
+                assert!(peek_test_source(&source, cx).is_none());
+                assert!(!frame_is_cached(window, &image, 0));
+                assert!(frame_is_cached(window, &unrelated, 0));
+            });
+            assert_frames_cached(&mut second, &image, false);
+            assert_frames_cached(&mut second, &unrelated, true);
+
+            first
+                .cx
+                .update(|cx| assert!(fetch_test_source(&source, cx).is_none()));
+            first.run_until_parked();
+            let replacement = first
+                .cx
+                .read(|cx| peek_test_source(&source, cx).unwrap().unwrap());
+            assert_ne!(image.id, replacement.id);
+            paint_frames(&mut first, &replacement);
+            first.cx.update(|cx| source.evict(None, cx));
+            assert_frames_cached(&mut first, &replacement, false);
+        }
+    }
+
+    #[gpui::test]
+    fn evict_render_source_removes_every_frame_from_all_windows(cx: &mut TestAppContext) {
+        let (mut first, mut second) = test_windows(cx);
+        let image = test_image(3);
+        let unrelated = test_image(1);
+        let source = ImageSource::Render(image.clone());
+        for window in [&mut first, &mut second] {
+            paint_frames(window, &image);
+            paint_frames(window, &unrelated);
+            assert_frames_cached(window, &image, true);
+        }
+
+        first.update(|window, cx| {
+            source.evict(None, cx);
+            for frame_index in 0..image.frame_count() {
+                assert!(frame_is_cached(window, &image, frame_index));
+            }
+            source.evict(Some(window), cx);
+            source.evict(Some(window), cx);
+            for frame_index in 0..image.frame_count() {
+                assert!(!frame_is_cached(window, &image, frame_index));
+            }
+            assert!(frame_is_cached(window, &unrelated, 0));
+            ImageSource::Render(test_image(0)).evict(Some(window), cx);
+        });
+        assert_frames_cached(&mut second, &image, false);
+        assert_frames_cached(&mut second, &unrelated, true);
+
+        paint_frames(&mut first, &image);
+        assert_frames_cached(&mut first, &image, true);
+        first.cx.update(|cx| source.evict(None, cx));
+        assert_frames_cached(&mut first, &image, false);
+    }
+
+    #[gpui::test]
+    fn evict_pending_sources_cancels_loads_and_allows_replacement(cx: &mut TestAppContext) {
+        for source in test_sources() {
+            for run_worker_first in [false, true] {
+                cx.run_until_parked();
+                cx.update(|cx| {
+                    assert!(fetch_test_source(&source, cx).is_none());
+                    assert!(source.is_asset_cached(cx));
+                });
+                if run_worker_first {
+                    assert!(cx.dispatcher.tick(true));
+                }
+                cx.update(|cx| {
+                    assert!(peek_test_source(&source, cx).is_none());
+                    source.evict(None, cx);
+                    assert!(!source.is_asset_cached(cx));
+                    assert!(fetch_test_source(&source, cx).is_none());
+                });
+                cx.run_until_parked();
+                cx.update(|cx| {
+                    assert!(peek_test_source(&source, cx).unwrap().is_ok());
+                    source.evict(None, cx);
+                    assert!(!source.is_asset_cached(cx));
+                });
+                cx.run_until_parked();
+                assert!(cx.read(|cx| peek_test_source(&source, cx).is_none()));
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn evict_cached_failures_does_not_start_a_load(cx: &mut TestAppContext) {
+        let sources = [
+            ImageSource::Resource(Resource::Embedded("missing-eviction-test".into())),
+            ImageSource::Image(Arc::new(Image::empty())),
+        ];
+        for source in sources {
+            cx.update(|cx| {
+                source.evict(None, cx);
+                assert!(!source.is_asset_cached(cx));
+                assert!(fetch_test_source(&source, cx).is_none());
+            });
+            cx.run_until_parked();
+            cx.update(|cx| {
+                assert!(peek_test_source(&source, cx).unwrap().is_err());
+                source.evict(None, cx);
+                assert!(!source.is_asset_cached(cx));
+                assert!(peek_test_source(&source, cx).is_none());
+                assert!(fetch_test_source(&source, cx).is_none());
+            });
+            cx.run_until_parked();
+            assert!(cx.read(|cx| peek_test_source(&source, cx).unwrap().is_err()));
+        }
+    }
+
+    struct ScopedTestCache(Arc<RenderImage>);
+
+    impl ImageCache for ScopedTestCache {
+        fn load(
+            &mut self,
+            _resource: &Resource,
+            _window: &mut Window,
+            _cx: &mut App,
+        ) -> Option<Result<Arc<RenderImage>, ImageCacheError>> {
+            Some(Ok(self.0.clone()))
+        }
+    }
+
+    #[gpui::test]
+    fn evict_does_not_invoke_custom_loaders_or_clear_scoped_caches(cx: &mut TestAppContext) {
+        let (mut first, mut second) = test_windows(cx);
+        let image = test_image(1);
+        let calls = Rc::new(Cell::new(0));
+        let custom = ImageSource::Custom(Arc::new({
+            let calls = calls.clone();
+            let image = image.clone();
+            move |_, _| {
+                calls.set(calls.get() + 1);
+                Some(Ok(image.clone()))
+            }
+        }));
+        let resource = ImageSource::Resource(Resource::Embedded("scoped-test".into()));
+        let cache = first
+            .cx
+            .update(|cx| cx.new(|_| ScopedTestCache(image.clone())));
+
+        paint_frames(&mut first, &image);
+        paint_frames(&mut second, &image);
+        first.update(|window, cx| {
+            let scoped_image = resource
+                .get_data(Some(cache.clone().into()), window, cx)
+                .unwrap()
+                .unwrap();
+            assert!(Arc::ptr_eq(&scoped_image, &image));
+            assert!(!resource.is_asset_cached(cx));
+
+            custom.evict(Some(window), cx);
+            resource.evict(Some(window), cx);
+            assert_eq!(calls.get(), 0);
+            assert!(frame_is_cached(window, &image, 0));
+            let still_scoped = resource
+                .get_data(Some(cache.clone().into()), window, cx)
+                .unwrap()
+                .unwrap();
+            assert!(Arc::ptr_eq(&still_scoped, &image));
+            assert!(Arc::ptr_eq(
+                &custom.get_data(None, window, cx).unwrap().unwrap(),
+                &image
+            ));
+            assert_eq!(calls.get(), 1);
+        });
+        assert_frames_cached(&mut second, &image, true);
     }
 
     #[gpui::test]

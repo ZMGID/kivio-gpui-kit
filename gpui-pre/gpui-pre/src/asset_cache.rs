@@ -179,13 +179,21 @@ mod tests {
         let (sender, receiver) = oneshot::channel();
         let source = TestAssetSource::new(1, [receiver]);
 
+        assert_eq!(cx.read(|cx| cx.peek_asset::<TestAsset>(&source)), None);
+        assert_eq!(source.load_count(), 0);
+
         assert_eq!(cx.update(|cx| cx.fetch_asset::<TestAsset>(&source)), None);
         assert_eq!(cx.update(|cx| cx.fetch_asset::<TestAsset>(&source)), None);
+        assert_eq!(cx.read(|cx| cx.peek_asset::<TestAsset>(&source)), None);
         assert_eq!(source.load_count(), 1);
 
         assert!(sender.send(Ok(42)).is_ok());
         cx.run_until_parked();
 
+        assert_eq!(
+            cx.read(|cx| cx.peek_asset::<TestAsset>(&source)),
+            Some(Ok(42))
+        );
         assert_eq!(
             cx.update(|cx| cx.fetch_asset::<TestAsset>(&source)),
             Some(Ok(42))
@@ -250,6 +258,7 @@ mod tests {
         cx.run_until_parked();
 
         cx.update(|cx| cx.remove_asset::<TestAsset>(&source));
+        assert_eq!(cx.read(|cx| cx.peek_asset::<TestAsset>(&source)), None);
         assert!(!cx.update(|cx| cx.has_asset::<TestAsset>(&source)));
         cx.run_until_parked();
         assert!(stale_sender.send(Ok(1)).is_err());
@@ -261,10 +270,41 @@ mod tests {
         cx.run_until_parked();
 
         assert_eq!(
+            cx.read(|cx| cx.peek_asset::<TestAsset>(&source)),
+            Some(Err("replacement failed"))
+        );
+        assert_eq!(
             cx.update(|cx| cx.fetch_asset::<TestAsset>(&source)),
             Some(Err("replacement failed"))
         );
         assert_eq!(source.load_count(), 2);
+    }
+
+    #[gpui::test]
+    fn removing_pending_asset_does_not_notify_subscribers(cx: &mut TestAppContext) {
+        let (sender, receiver) = oneshot::channel();
+        let source = TestAssetSource::new(4, [receiver]);
+        let notifications = Rc::new(Cell::new(0));
+        let entity = cx.update(|cx| {
+            let entity = cx.new(|_| ());
+            cx.observe(&entity, {
+                let notifications = notifications.clone();
+                move |_, _| notifications.set(notifications.get() + 1)
+            })
+            .detach();
+            assert!(
+                cx.asset_entry::<TestAsset>(&source)
+                    .use_by(entity.entity_id())
+                    .is_none()
+            );
+            entity
+        });
+        cx.run_until_parked();
+        cx.update(|cx| cx.remove_asset::<TestAsset>(&source));
+        cx.run_until_parked();
+        assert!(sender.send(Ok(1)).is_err());
+        assert_eq!(notifications.get(), 0);
+        drop(entity);
     }
 
     #[gpui::test]
@@ -279,12 +319,14 @@ mod tests {
             assert!(cx.background_executor.tick());
         }
         assert_eq!(cx.update(|cx| cx.fetch_asset::<TestAsset>(&source)), None);
+        assert_eq!(cx.read(|cx| cx.peek_asset::<TestAsset>(&source)), None);
 
         cx.update(|cx| {
             cx.remove_asset::<TestAsset>(&source);
             assert_eq!(cx.fetch_asset::<TestAsset>(&source), None);
         });
         cx.run_until_parked();
+        assert_eq!(cx.read(|cx| cx.peek_asset::<TestAsset>(&source)), None);
         assert_eq!(cx.update(|cx| cx.fetch_asset::<TestAsset>(&source)), None);
 
         assert!(replacement_sender.send(Ok(2)).is_ok());

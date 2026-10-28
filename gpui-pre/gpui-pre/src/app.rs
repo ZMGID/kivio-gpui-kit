@@ -3147,6 +3147,16 @@ impl App {
         self.loading_assets.remove(&asset_id);
     }
 
+    /// Returns a completed cached asset without starting or subscribing to a load.
+    /// Returns `None` if the asset is absent or still loading.
+    pub fn peek_asset<A: Asset>(&self, source: &A::Source) -> Option<A::Output> {
+        let asset_id = (TypeId::of::<A>(), hash(source));
+        self.loading_assets
+            .get(&asset_id)?
+            .downcast_ref::<CachedLoad<A::Output>>()?
+            .get()
+    }
+
     /// Check whether an asset is present in GPUI's cache (loading or loaded),
     /// without fetching it.
     #[cfg(any(test, feature = "test-support"))]

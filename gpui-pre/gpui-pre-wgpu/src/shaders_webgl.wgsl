@@ -92,6 +92,13 @@ fn read_edges(cursor: ptr<function, InstanceCursor>) -> Edges {
     );
 }
 
+fn read_edge_fade(cursor: ptr<function, InstanceCursor>) -> EdgeFadeParams {
+    return EdgeFadeParams(
+        read_f32(cursor), read_f32(cursor), read_f32(cursor), read_f32(cursor),
+        read_f32(cursor), read_f32(cursor), read_f32(cursor), read_f32(cursor),
+    );
+}
+
 fn read_color_stop(cursor: ptr<function, InstanceCursor>) -> LinearColorStop {
     return LinearColorStop(read_hsla(cursor), read_f32(cursor));
 }
@@ -138,7 +145,7 @@ fn read_transformation(cursor: ptr<function, InstanceCursor>) -> TransformationM
 fn load_quad(instance_id: u32) -> Quad {
     // Keep this fixed-layout decoder explicit. Some WebGL shader compilers fail
     // to optimize the cursor's branches and dynamic vector indexing for quads.
-    let first_texel_index = instance_id * 10u;
+    let first_texel_index = instance_id * 12u;
     let width = textureDimensions(t_instances).x;
     let texel0 = fetch_instance_texel(first_texel_index, width);
     let texel1 = fetch_instance_texel(first_texel_index + 1u, width);
@@ -150,6 +157,8 @@ fn load_quad(instance_id: u32) -> Quad {
     let texel7 = fetch_instance_texel(first_texel_index + 7u, width);
     let texel8 = fetch_instance_texel(first_texel_index + 8u, width);
     let texel9 = fetch_instance_texel(first_texel_index + 9u, width);
+    let texel10 = fetch_instance_texel(first_texel_index + 10u, width);
+    let texel11 = fetch_instance_texel(first_texel_index + 11u, width);
 
     let values0 = bitcast<vec4<f32>>(texel0);
     let values1 = bitcast<vec4<f32>>(texel1);
@@ -161,6 +170,8 @@ fn load_quad(instance_id: u32) -> Quad {
     let values7 = bitcast<vec4<f32>>(texel7);
     let values8 = bitcast<vec4<f32>>(texel8);
     let values9 = bitcast<vec4<f32>>(texel9);
+    let values10 = bitcast<vec4<f32>>(texel10);
+    let values11 = bitcast<vec4<f32>>(texel11);
 
     return Quad(
         texel0.x,
@@ -187,6 +198,8 @@ fn load_quad(instance_id: u32) -> Quad {
         Hsla(values7.x, values7.y, values7.z, values7.w),
         Corners(values8.x, values8.y, values8.z, values8.w),
         Edges(values9.x, values9.y, values9.z, values9.w),
+        EdgeFadeParams(values10.x, values10.y, values10.z, values10.w,
+                       values11.x, values11.y, values11.z, values11.w),
     );
 }
 
@@ -235,7 +248,7 @@ fn load_underline(instance_id: u32) -> Underline {
 }
 
 fn load_mono_sprite(instance_id: u32) -> MonochromeSprite {
-    var cursor = instance_cursor(instance_id * 28u);
+    var cursor = instance_cursor(instance_id * 36u);
     return MonochromeSprite(
         read_word(&cursor),
         read_word(&cursor),
@@ -244,11 +257,12 @@ fn load_mono_sprite(instance_id: u32) -> MonochromeSprite {
         read_bounds(&cursor),
         read_hsla(&cursor),
         read_transformation(&cursor),
+        read_edge_fade(&cursor),
     );
 }
 
 fn load_poly_sprite(instance_id: u32) -> PolychromeSprite {
-    var cursor = instance_cursor(instance_id * 24u);
+    var cursor = instance_cursor(instance_id * 32u);
     return PolychromeSprite(
         read_word(&cursor),
         read_word(&cursor),
@@ -258,5 +272,6 @@ fn load_poly_sprite(instance_id: u32) -> PolychromeSprite {
         read_bounds(&cursor),
         read_bounds(&cursor),
         read_corners(&cursor),
+        read_edge_fade(&cursor),
     );
 }

@@ -41,6 +41,17 @@ struct Edges {
     float left;
 };
 
+struct EdgeFadeParams {
+    float top_y;
+    float bottom_y;
+    float band_top;
+    float band_bottom;
+    float left_x;
+    float right_x;
+    float band_left;
+    float band_right;
+};
+
 struct Hsla {
     float h;
     float s;
@@ -97,6 +108,23 @@ struct TransformationMatrix {
 
 static const float M_PI_F = 3.141592653f;
 static const float3 GRAYSCALE_FACTORS = float3(0.2126f, 0.7152f, 0.0722f);
+
+float edge_fade_alpha(float2 position, EdgeFadeParams fade) {
+    float ramp = 1.0;
+    if (fade.band_top > 0.0) {
+        ramp = min(ramp, clamp((position.y - fade.top_y) / fade.band_top, 0.0, 1.0));
+    }
+    if (fade.band_bottom > 0.0) {
+        ramp = min(ramp, clamp((fade.bottom_y - position.y) / fade.band_bottom, 0.0, 1.0));
+    }
+    if (fade.band_left > 0.0) {
+        ramp = min(ramp, clamp((position.x - fade.left_x) / fade.band_left, 0.0, 1.0));
+    }
+    if (fade.band_right > 0.0) {
+        ramp = min(ramp, clamp((fade.right_x - position.x) / fade.band_right, 0.0, 1.0));
+    }
+    return ramp * ramp;
+}
 
 float4 to_device_position_impl(float2 position) {
     float2 device_position = position / global_viewport_size * float2(2.0, -2.0) + float2(-1.0, 1.0);
@@ -507,6 +535,7 @@ struct Quad {
     Hsla border_color;
     Corners corner_radii;
     Edges border_widths;
+    EdgeFadeParams fade;
 };
 
 struct QuadVertexOutput {
@@ -560,6 +589,7 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
     Quad quad = quads[input.quad_id];
     float4 background_color = gradient_color(quad.background, input.position.xy, quad.bounds,
     input.background_solid, input.background_color0, input.background_color1);
+    float edge_fade = edge_fade_alpha(input.position.xy, quad.fade);
 
     bool unrounded = quad.corner_radii.top_left == 0.0 &&
         quad.corner_radii.top_right == 0.0 &&
@@ -572,7 +602,7 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
         quad.border_widths.right == 0.0 &&
         quad.border_widths.bottom == 0.0 &&
         unrounded) {
-        return background_color;
+        return background_color * float4(1.0, 1.0, 1.0, edge_fade);
     }
 
     float2 size = quad.bounds.size;
@@ -631,7 +661,7 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
 
     // Fast path for points that must be part of the background
     if (is_within_inner_straight_border && !is_near_rounded_corner) {
-        return background_color;
+        return background_color * float4(1.0, 1.0, 1.0, edge_fade);
     }
 
     // Signed distance of the point to the outside edge of the quad's border
@@ -844,7 +874,7 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
                     saturate(antialias_threshold - inner_sdf));
     }
 
-    return color * float4(1.0, 1.0, 1.0, saturate(antialias_threshold - outer_sdf));
+    return color * float4(1.0, 1.0, 1.0, saturate(antialias_threshold - outer_sdf) * edge_fade);
 }
 
 /*
@@ -1145,9 +1175,11 @@ struct MonochromeSprite {
     Bounds content_mask;
     Hsla color;
     TransformationMatrix transformation;
+    EdgeFadeParams fade;
 };
 
 struct MonochromeSpriteVertexOutput {
+    nointerpolation uint sprite_id: TEXCOORD0;
     float4 position: SV_Position;
     float2 tile_position: POSITION;
     nointerpolation float4 color: COLOR;
@@ -1155,6 +1187,7 @@ struct MonochromeSpriteVertexOutput {
 };
 
 struct MonochromeSpriteFragmentInput {
+    nointerpolation uint sprite_id: TEXCOORD0;
     float4 position: SV_Position;
     float2 tile_position: POSITION;
     nointerpolation float4 color: COLOR;
@@ -1177,6 +1210,7 @@ MonochromeSpriteVertexOutput monochrome_sprite_vertex(uint vertex_id: SV_VertexI
     output.position = device_position;
     output.tile_position = tile_position;
     output.color = color;
+    output.sprite_id = sprite_id;
     output.clip_distance = clip_distance;
     return output;
 }
@@ -1184,7 +1218,7 @@ MonochromeSpriteVertexOutput monochrome_sprite_vertex(uint vertex_id: SV_VertexI
 float4 monochrome_sprite_fragment(MonochromeSpriteFragmentInput input): SV_Target {
     float sample = t_sprite.Sample(s_sprite, input.tile_position).r;
     float alpha_corrected = apply_contrast_and_gamma_correction(sample, input.color.rgb, grayscale_enhanced_contrast, gamma_ratios);
-    return float4(input.color.rgb, input.color.a * alpha_corrected);
+    return float4(input.color.rgb, input.color.a * alpha_corrected * edge_fade_alpha(input.position.xy, mono_sprites[input.sprite_id].fade));
 }
 
 MonochromeSpriteVertexOutput subpixel_sprite_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_InstanceID) {
@@ -1200,7 +1234,7 @@ SubpixelSpriteFragmentOutput subpixel_sprite_fragment(MonochromeSpriteFragmentIn
 
     SubpixelSpriteFragmentOutput output;
     output.foreground = float4(input.color.rgb, 1.0f);
-    output.alpha = float4(input.color.a * alpha_corrected, 1.0f);
+    output.alpha = float4(input.color.a * alpha_corrected * edge_fade_alpha(input.position.xy, mono_sprites[input.sprite_id].fade), 1.0f);
     return output;
 }
 
@@ -1219,6 +1253,7 @@ struct PolychromeSprite {
     Bounds bounds;
     Bounds content_mask;
     Corners corner_radii;
+    EdgeFadeParams fade;
 };
 
 struct PolychromeSpriteVertexOutput {

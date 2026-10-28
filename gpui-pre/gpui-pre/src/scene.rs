@@ -529,6 +529,22 @@ impl PrimitiveBatch {
     }
 }
 
+/// Device-pixel edge fade parameters carried by individual scene primitives.
+/// A zero band disables that edge; a zeroed value leaves opacity unchanged.
+#[derive(Default, Debug, Copy, Clone, PartialEq)]
+#[repr(C)]
+#[expect(missing_docs)]
+pub struct EdgeFadeParams {
+    pub top_y: f32,
+    pub bottom_y: f32,
+    pub band_top: f32,
+    pub band_bottom: f32,
+    pub left_x: f32,
+    pub right_x: f32,
+    pub band_left: f32,
+    pub band_right: f32,
+}
+
 #[derive(Default, Debug, Copy, Clone)]
 #[repr(C)]
 #[expect(missing_docs)]
@@ -541,6 +557,7 @@ pub struct Quad {
     pub border_color: Hsla,
     pub corner_radii: Corners<ScaledPixels>,
     pub border_widths: Edges<ScaledPixels>,
+    pub fade: EdgeFadeParams,
 }
 
 impl From<Quad> for Primitive {
@@ -716,6 +733,7 @@ pub struct MonochromeSprite {
     pub content_mask: ContentMask<ScaledPixels>,
     pub color: Hsla,
     pub transformation: TransformationMatrix,
+    pub fade: EdgeFadeParams,
 }
 
 impl From<MonochromeSprite> for Primitive {
@@ -735,6 +753,7 @@ pub struct SubpixelSprite {
     pub content_mask: ContentMask<ScaledPixels>,
     pub color: Hsla,
     pub transformation: TransformationMatrix,
+    pub fade: EdgeFadeParams,
 }
 
 impl From<SubpixelSprite> for Primitive {
@@ -755,6 +774,7 @@ pub struct PolychromeSprite {
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
     pub corner_radii: Corners<ScaledPixels>,
+    pub fade: EdgeFadeParams,
 }
 
 impl From<PolychromeSprite> for Primitive {

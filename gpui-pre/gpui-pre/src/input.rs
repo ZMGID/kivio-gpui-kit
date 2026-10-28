@@ -319,7 +319,7 @@ impl<V: EntityInputHandler> InputHandler for ElementInputHandler<V> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{
         AnyWindowHandle, AppContext as _, FocusHandle, InteractiveElement as _, IntoElement,
@@ -502,10 +502,10 @@ mod tests {
         );
     }
 
-    struct ConfigurationTestView {
-        focus_handle: FocusHandle,
-        configuration: TextInputConfiguration,
-        accepts_text_input: bool,
+    pub(crate) struct ConfigurationTestView {
+        pub(crate) focus_handle: FocusHandle,
+        pub(crate) configuration: TextInputConfiguration,
+        pub(crate) accepts_text_input: bool,
     }
 
     impl Render for ConfigurationTestView {

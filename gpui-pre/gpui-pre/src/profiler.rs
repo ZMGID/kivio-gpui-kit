@@ -1356,9 +1356,11 @@ impl WindowProfiler {
             .push(WindowActivity::Draw { started_at });
     }
 
-    /// Records the phases of the window draw in progress.
+    /// Accumulates the phases of the window draw in progress.
     pub fn record_draw_phases(&mut self, phases: DrawPhases) {
-        self.draw_phases = phases;
+        self.draw_phases.request_layout += phases.request_layout;
+        self.draw_phases.prepaint += phases.prepaint;
+        self.draw_phases.paint += phases.paint;
     }
 
     /// Records the start of one phase of drawing a view, returning its start
@@ -1879,6 +1881,39 @@ mod tests {
             delta.draw_duration.len() + delta.work.len() + delta.input_work.len(),
             0
         );
+    }
+
+    #[test]
+    fn draw_phases_accumulate_for_each_pass_and_reset_after_the_draw() {
+        let (_journal, _guard) = journal::install_test_foreground_journal(64, 4);
+        let mut profiler = WindowProfiler::new(WindowId::from(0xD0A1)).unwrap();
+        let first = DrawPhases {
+            request_layout: Duration::from_millis(1),
+            prepaint: Duration::from_millis(2),
+            paint: Duration::from_millis(3),
+        };
+        let second = DrawPhases {
+            request_layout: Duration::from_millis(4),
+            prepaint: Duration::from_millis(5),
+            paint: Duration::from_millis(6),
+        };
+        profiler.begin_draw();
+        profiler.record_draw_phases(first);
+        profiler.record_draw_phases(second);
+        profiler.end_draw(None, 0);
+        assert_eq!(
+            profiler.pending_frame.unwrap().phases,
+            DrawPhases {
+                request_layout: first.request_layout + second.request_layout,
+                prepaint: first.prepaint + second.prepaint,
+                paint: first.paint + second.paint,
+            },
+        );
+
+        profiler.begin_draw();
+        profiler.record_draw_phases(first);
+        profiler.end_draw(None, 0);
+        assert_eq!(profiler.pending_frame.unwrap().phases, first);
     }
 
     #[test]

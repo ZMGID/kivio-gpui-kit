@@ -34,6 +34,24 @@ float blur_along_x(float x, float y, float sigma, float corner,
                    float2 half_size);
 float4 over(float4 below, float4 above);
 float radians(float degrees);
+
+float edge_fade_alpha(float2 position, EdgeFadeParams fade) {
+  float ramp = 1.0;
+  if (fade.band_top > 0.0) {
+    ramp = min(ramp, clamp((position.y - fade.top_y) / fade.band_top, 0.0, 1.0));
+  }
+  if (fade.band_bottom > 0.0) {
+    ramp = min(ramp, clamp((fade.bottom_y - position.y) / fade.band_bottom, 0.0, 1.0));
+  }
+  if (fade.band_left > 0.0) {
+    ramp = min(ramp, clamp((position.x - fade.left_x) / fade.band_left, 0.0, 1.0));
+  }
+  if (fade.band_right > 0.0) {
+    ramp = min(ramp, clamp((fade.right_x - position.x) / fade.band_right, 0.0, 1.0));
+  }
+  return ramp * ramp;
+}
+
 float4 fill_color(Background background, float2 position, Bounds_ScaledPixels bounds,
   float4 solid_color, float4 color0, float4 color1);
 
@@ -103,6 +121,7 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
   Quad quad = quads[input.quad_id];
   float4 background_color = fill_color(quad.background, input.position.xy, quad.bounds,
     input.background_solid, input.background_color0, input.background_color1);
+  float edge_fade = edge_fade_alpha(input.position.xy, quad.fade);
 
   bool unrounded = quad.corner_radii.top_left == 0.0 &&
     quad.corner_radii.bottom_left == 0.0 &&
@@ -115,7 +134,7 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
       quad.border_widths.right == 0.0 &&
       quad.border_widths.bottom == 0.0 &&
       unrounded) {
-    return background_color;
+    return background_color * float4(1.0, 1.0, 1.0, edge_fade);
   }
 
   float2 size = float2(quad.bounds.size.width, quad.bounds.size.height);
@@ -175,7 +194,7 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
 
   // Fast path for points that must be part of the background
   if (is_within_inner_straight_border && !is_near_rounded_corner) {
-    return background_color;
+    return background_color * float4(1.0, 1.0, 1.0, edge_fade);
   }
 
   // Signed distance of the point to the outside edge of the quad's border
@@ -393,7 +412,7 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
                 saturate(antialias_threshold - inner_sdf));
   }
 
-  return color * float4(1.0, 1.0, 1.0, saturate(antialias_threshold - outer_sdf));
+  return color * float4(1.0, 1.0, 1.0, saturate(antialias_threshold - outer_sdf) * edge_fade);
 }
 
 // Returns the dash velocity of a corner given the dash velocity of the two
@@ -622,6 +641,7 @@ struct MonochromeSpriteVertexOutput {
   float4 position [[position]];
   float2 tile_position;
   float4 color [[flat]];
+  uint sprite_id [[flat]];
   float4 clip_distance;
 };
 
@@ -629,6 +649,7 @@ struct MonochromeSpriteFragmentInput {
   float4 position [[position]];
   float2 tile_position;
   float4 color [[flat]];
+  uint sprite_id [[flat]];
   float4 clip_distance;
 };
 
@@ -652,6 +673,7 @@ vertex MonochromeSpriteVertexOutput monochrome_sprite_vertex(
       device_position,
       tile_position,
       color,
+      sprite_id,
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
 }
 
@@ -668,7 +690,7 @@ fragment float4 monochrome_sprite_fragment(
   float4 sample =
       atlas_texture.sample(atlas_texture_sampler, input.tile_position);
   float4 color = input.color;
-  color.a *= sample.a;
+  color.a *= sample.a * edge_fade_alpha(input.position.xy, sprites[input.sprite_id].fade);
   return color;
 }
 
@@ -727,7 +749,7 @@ fragment float4 polychrome_sprite_fragment(
     color.g = grayscale;
     color.b = grayscale;
   }
-  color.a *= sprite.opacity * saturate(0.5 - distance);
+  color.a *= sprite.opacity * saturate(0.5 - distance) * edge_fade_alpha(input.position.xy, sprite.fade);
   return color;
 }
 

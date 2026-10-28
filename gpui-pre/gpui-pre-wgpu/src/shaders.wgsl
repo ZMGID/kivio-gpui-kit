@@ -516,6 +516,34 @@ fn gradient_color(background: Background, position: vec2<f32>, bounds: Bounds,
 
 // --- quads --- //
 
+struct EdgeFadeParams {
+    top_y: f32,
+    bottom_y: f32,
+    band_top: f32,
+    band_bottom: f32,
+    left_x: f32,
+    right_x: f32,
+    band_left: f32,
+    band_right: f32,
+}
+
+fn edge_fade_alpha(position: vec2<f32>, fade: EdgeFadeParams) -> f32 {
+    var ramp = 1.0;
+    if (fade.band_top > 0.0) {
+        ramp = min(ramp, clamp((position.y - fade.top_y) / fade.band_top, 0.0, 1.0));
+    }
+    if (fade.band_bottom > 0.0) {
+        ramp = min(ramp, clamp((fade.bottom_y - position.y) / fade.band_bottom, 0.0, 1.0));
+    }
+    if (fade.band_left > 0.0) {
+        ramp = min(ramp, clamp((position.x - fade.left_x) / fade.band_left, 0.0, 1.0));
+    }
+    if (fade.band_right > 0.0) {
+        ramp = min(ramp, clamp((fade.right_x - position.x) / fade.band_right, 0.0, 1.0));
+    }
+    return ramp * ramp;
+}
+
 struct Quad {
     order: u32,
     border_style: u32,
@@ -525,6 +553,7 @@ struct Quad {
     border_color: Hsla,
     corner_radii: Corners,
     border_widths: Edges,
+    fade: EdgeFadeParams,
 }
 
 struct QuadVarying {
@@ -572,6 +601,7 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
 
     let background_color = gradient_color(quad.background, input.position.xy, quad.bounds,
         input.background_solid, input.background_color0, input.background_color1);
+    let edge_fade = edge_fade_alpha(input.position.xy, quad.fade);
 
     let unrounded = quad.corner_radii.top_left == 0.0 &&
         quad.corner_radii.bottom_left == 0.0 &&
@@ -584,7 +614,7 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
             quad.border_widths.right == 0.0 &&
             quad.border_widths.bottom == 0.0 &&
             unrounded) {
-        return blend_color(background_color, 1.0);
+        return blend_color(background_color, edge_fade);
     }
 
     let size = quad.bounds.size;
@@ -650,7 +680,7 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
     // However, that might negatively impact performance in the case of
     // reasonable sizes for rounded corners.
     if (is_within_inner_straight_border && !is_near_rounded_corner) {
-        return blend_color(background_color, 1.0);
+        return blend_color(background_color, edge_fade);
     }
 
     // Signed distance of the point to the outside edge of the quad's border. It
@@ -889,7 +919,7 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
                     saturate(antialias_threshold - inner_sdf));
     }
 
-    return blend_color(color, saturate(antialias_threshold - outer_sdf));
+    return blend_color(color, saturate(antialias_threshold - outer_sdf) * edge_fade);
 }
 
 // Returns the dash velocity of a corner given the dash velocity of the two
@@ -1220,6 +1250,7 @@ struct MonochromeSprite {
     content_mask: Bounds,
     color: Hsla,
     transformation: TransformationMatrix,
+    fade: EdgeFadeParams,
 }
 
 
@@ -1228,6 +1259,7 @@ struct MonoSpriteVarying {
     @location(0) tile_position: vec2<f32>,
     @location(1) @interpolate(flat) color: vec4<f32>,
     @location(3) clip_distances: vec4<f32>,
+    @location(4) @interpolate(flat) sprite_id: u32,
 }
 
 @vertex
@@ -1240,6 +1272,7 @@ fn vs_mono_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
 
     out.tile_position = to_tile_position(unit_vertex, sprite.tile);
     out.color = hsla_to_rgba(sprite.color);
+    out.sprite_id = instance_id;
     out.clip_distances = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds, sprite.content_mask, sprite.transformation);
     return out;
 }
@@ -1254,7 +1287,7 @@ fn fs_mono_sprite(input: MonoSpriteVarying) -> @location(0) vec4<f32> {
         return vec4<f32>(0.0);
     }
 
-    return blend_color(input.color, alpha_corrected);
+    return blend_color(input.color, alpha_corrected * edge_fade_alpha(input.position.xy, load_mono_sprite(input.sprite_id).fade));
 }
 
 // --- polychrome sprites --- //
@@ -1268,6 +1301,7 @@ struct PolychromeSprite {
     bounds: Bounds,
     content_mask: Bounds,
     corner_radii: Corners,
+    fade: EdgeFadeParams,
 }
 
 
@@ -1307,7 +1341,7 @@ fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
         let grayscale = dot(color.rgb, GRAYSCALE_FACTORS);
         color = vec4<f32>(vec3<f32>(grayscale), sample.a);
     }
-    return blend_color(color, sprite.opacity * saturate(0.5 - distance));
+    return blend_color(color, sprite.opacity * saturate(0.5 - distance) * edge_fade_alpha(input.position.xy, sprite.fade));
 }
 
 // --- surfaces --- //

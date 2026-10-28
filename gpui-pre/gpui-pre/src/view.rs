@@ -1,7 +1,7 @@
 use crate::{
     AnyElement, AnyEntity, AnyWeakEntity, App, AvailableSpace, Bounds, ContentMask, Context,
-    Element, ElementId, Entity, EntityId, GlobalElementId, InspectorElementId, IntoElement,
-    LayoutId, PaintIndex, Pixels, PrepaintStateIndex, Render, RenderOnce, Size, Style,
+    EdgeFade, Element, ElementId, Entity, EntityId, GlobalElementId, InspectorElementId,
+    IntoElement, LayoutId, PaintIndex, Pixels, PrepaintStateIndex, Render, RenderOnce, Size, Style,
     StyleRefinement, TextStyle, WeakEntity,
 };
 use crate::{Empty, Window};
@@ -14,6 +14,9 @@ use std::{
     fmt,
     ops::Range,
 };
+
+#[cfg(test)]
+mod fade_cache_tests;
 
 /// A dynamically-typed view handle that can be downcast to a specific `Entity<V>`.
 ///
@@ -324,6 +327,7 @@ struct ViewElementState {
     prepaint_range: Range<PrepaintStateIndex>,
     paint_range: Range<PaintIndex>,
     cache_key: ViewElementCacheKey,
+    paint_fade: Option<EdgeFade>,
     accessed_entities: FxHashSet<EntityId>,
 }
 
@@ -331,6 +335,7 @@ struct ViewElementCacheKey {
     bounds: Bounds<Pixels>,
     content_mask: ContentMask<Pixels>,
     text_style: TextStyle,
+    edge_fade: Option<EdgeFade>,
 }
 
 #[cfg(not(gpui_hot_reload))]
@@ -547,6 +552,7 @@ fn prepaint_view(
                     && element_state.cache_key.bounds == bounds
                     && element_state.cache_key.content_mask == content_mask
                     && element_state.cache_key.text_style == text_style
+                    && element_state.cache_key.edge_fade == window.edge_fade
                     && !window.dirty_views.contains(&entity_id)
                     && !window.refreshing
                 {
@@ -578,10 +584,12 @@ fn prepaint_view(
                         accessed_entities,
                         prepaint_range: prepaint_start..prepaint_end,
                         paint_range: PaintIndex::default()..PaintIndex::default(),
+                        paint_fade: None,
                         cache_key: ViewElementCacheKey {
                             bounds,
                             content_mask,
                             text_style,
+                            edge_fade: window.edge_fade,
                         },
                     },
                 )
@@ -622,13 +630,18 @@ fn paint_view(
 
                     let paint_start = window.paint_index();
 
+                    let paint_fade = window.edge_fade;
                     if let Some(element) = element {
                         let refreshing = mem::replace(&mut window.refreshing, true);
                         element.paint(window, cx);
                         window.refreshing = refreshing;
                     } else {
+                        if element_state.paint_fade != paint_fade {
+                            window.fade_cache_invalidations.insert(entity_id);
+                        }
                         window.reuse_paint(element_state.paint_range.clone());
                     }
+                    element_state.paint_fade = paint_fade;
 
                     let paint_end = window.paint_index();
                     element_state.paint_range = paint_start..paint_end;

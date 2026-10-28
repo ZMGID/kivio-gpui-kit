@@ -767,6 +767,50 @@ pub enum WindowControlArea {
     Min,
 }
 
+/// A scoped, window-coordinate edge fade. Each enabled edge fades from zero
+/// at the edge to full opacity one band inside the bounds.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EdgeFade {
+    /// Bounds of the faded region in window coordinates.
+    pub bounds: Bounds<Pixels>,
+    /// Default ramp width for each enabled edge.
+    pub band: Pixels,
+    /// Top-edge ramp width override.
+    pub band_top: Option<Pixels>,
+    /// Bottom-edge ramp width override.
+    pub band_bottom: Option<Pixels>,
+    /// Left-edge ramp width override.
+    pub band_left: Option<Pixels>,
+    /// Right-edge ramp width override.
+    pub band_right: Option<Pixels>,
+    /// Enable the top edge.
+    pub top: bool,
+    /// Enable the bottom edge.
+    pub bottom: bool,
+    /// Enable the left edge.
+    pub left: bool,
+    /// Enable the right edge.
+    pub right: bool,
+}
+
+impl EdgeFade {
+    fn top_band(&self) -> f32 {
+        self.band_top.unwrap_or(self.band).0.max(1.0)
+    }
+
+    fn bottom_band(&self) -> f32 {
+        self.band_bottom.unwrap_or(self.band).0.max(1.0)
+    }
+
+    fn left_band(&self) -> f32 {
+        self.band_left.unwrap_or(self.band).0.max(1.0)
+    }
+
+    fn right_band(&self) -> f32 {
+        self.band_right.unwrap_or(self.band).0.max(1.0)
+    }
+}
+
 /// An identifier for a [Hitbox] which also includes [HitboxBehavior].
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub struct HitboxId(u64);
@@ -1247,6 +1291,7 @@ pub struct Window {
     pub(crate) rendered_entity_stack: Vec<EntityId>,
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
     pub(crate) element_opacity: f32,
+    pub(crate) edge_fade: Option<EdgeFade>,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
     /// The [`TextInputConfiguration`] most recently forwarded to the platform
@@ -1262,6 +1307,7 @@ pub struct Window {
     pub(crate) tooltip_bounds: Option<TooltipBounds>,
     pub(crate) next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>>,
     pub(crate) dirty_views: FxHashSet<EntityId>,
+    pub(crate) fade_cache_invalidations: FxHashSet<EntityId>,
     focus_listeners: SubscriberSet<(), AnyWindowFocusListener>,
     pub(crate) focus_lost_listeners: SubscriberSet<(), AnyObserver>,
     focus_lost_path: SmallVec<[FocusId; 8]>,
@@ -2156,6 +2202,7 @@ impl Window {
             element_offset_stack: Vec::new(),
             content_mask_stack: Vec::new(),
             element_opacity: 1.0,
+            edge_fade: None,
             requested_autoscroll: None,
             last_text_input_configuration: None,
             focused_text_input: None,
@@ -2166,6 +2213,7 @@ impl Window {
             next_tooltip_id: TooltipId::default(),
             tooltip_bounds: None,
             dirty_views: FxHashSet::default(),
+            fade_cache_invalidations: FxHashSet::default(),
             focus_listeners: SubscriberSet::new(),
             focus_lost_listeners: SubscriberSet::new(),
             focus_lost_path: SmallVec::new(),
@@ -3296,7 +3344,7 @@ impl Window {
             color: style
                 .color
                 .unwrap_or_default()
-                .opacity(self.element_opacity()),
+                .opacity(self.element_opacity_at(origin)),
             thickness: self.snap_stroke(style.thickness),
             wavy: style.wavy.into(),
         }
@@ -3439,13 +3487,39 @@ impl Window {
     /// the contents of the new [`Scene`], use [`Self::present`].
     #[profiling::function]
     pub fn draw(&mut self, cx: &mut App) -> ArenaClearNeeded {
-        // Drain every draw in profiler builds so a previous frame's
-        // first-invalidation timestamp can't be attributed to this one.
+        // One profiler sample covers the provisional pass and any retry.
         #[cfg(feature = "profiler")]
-        let frame_dirty = self.invalidator.take_frame_dirty();
+        let mut frame_dirty = self.invalidator.take_frame_dirty();
         #[cfg(feature = "profiler")]
         self.window_profiler.begin_draw();
 
+        let clear = self.draw_with_fade_retry(
+            cx,
+            false,
+            None,
+            #[cfg(feature = "profiler")]
+            &mut frame_dirty,
+        );
+
+        #[cfg(feature = "profiler")]
+        {
+            self.window_profiler
+                .set_refresh_interval(self.refresh_interval(cx));
+            let draw_duration = self
+                .window_profiler
+                .end_draw(frame_dirty.dirty_at, frame_dirty.invalidations);
+            self.debug_frame_overlay.record_frame(draw_duration);
+        }
+        clear
+    }
+
+    fn draw_with_fade_retry(
+        &mut self,
+        cx: &mut App,
+        retried: bool,
+        previous_focus: Option<(SmallVec<[FocusId; 8]>, bool)>,
+        #[cfg(feature = "profiler")] frame_dirty: &mut FrameDirtyAccumulator,
+    ) -> ArenaClearNeeded {
         // Set up the per-App arena for element allocation during this draw.
         // This ensures that multiple test Apps have isolated arenas.
         let arena_scope = ElementArenaScope::enter(&cx.element_arena);
@@ -3492,6 +3566,52 @@ impl Window {
         self.dirty_views.clear();
         self.next_frame.window_active = self.active.get();
 
+        if !self.fade_cache_invalidations.is_empty() {
+            let previous_focus = previous_focus.unwrap_or_else(|| {
+                (
+                    self.rendered_frame.focus_path(),
+                    self.rendered_frame.window_active,
+                )
+            });
+            self.layout_engine.as_mut().unwrap().clear();
+            self.text_system().finish_frame();
+            self.next_frame.finish(&mut self.rendered_frame);
+            mem::swap(&mut self.rendered_frame, &mut self.next_frame);
+            self.next_frame.clear();
+            self.refreshing = false;
+            self.invalidator.set_phase(DrawPhase::None);
+
+            // Paint-only fade scopes cannot be compared during prepaint.
+            // Redraw affected views before publishing focus and input state.
+            let mut invalid = mem::take(&mut self.fade_cache_invalidations);
+            let mut refresh_all = retried;
+            for &view in &invalid {
+                self.mark_view_dirty(view);
+                refresh_all |= !self.dirty_views.contains(&view);
+            }
+            invalid.clear();
+            self.fade_cache_invalidations = invalid;
+            self.refreshing |= refresh_all;
+            arena_scope.exit(&cx.element_arena).clear(cx);
+
+            #[cfg(feature = "profiler")]
+            {
+                let retry_dirty = self.invalidator.take_frame_dirty();
+                frame_dirty.dirty_at = match (frame_dirty.dirty_at, retry_dirty.dirty_at) {
+                    (Some(first), Some(next)) => Some(first.min(next)),
+                    (first, next) => first.or(next),
+                };
+                frame_dirty.invalidations += retry_dirty.invalidations;
+            }
+            return self.draw_with_fade_retry(
+                cx,
+                true,
+                Some(previous_focus),
+                #[cfg(feature = "profiler")]
+                frame_dirty,
+            );
+        }
+
         // Register requested input handler with the platform window.
         // Use .take() instead of .pop() to preserve Vec length, so that cached
         // paint_range indices remain valid for reuse_paint on the next frame.
@@ -3526,8 +3646,12 @@ impl Window {
         self.next_frame.finish(&mut self.rendered_frame);
 
         self.invalidator.set_phase(DrawPhase::Focus);
-        let previous_focus_path = self.rendered_frame.focus_path();
-        let previous_window_active = self.rendered_frame.window_active;
+        let (previous_focus_path, previous_window_active) = previous_focus.unwrap_or_else(|| {
+            (
+                self.rendered_frame.focus_path(),
+                self.rendered_frame.window_active,
+            )
+        });
         mem::swap(&mut self.rendered_frame, &mut self.next_frame);
         self.next_frame.clear();
         let current_focus_path = self.rendered_frame.focus_path();
@@ -3581,18 +3705,6 @@ impl Window {
         }
         self.needs_present.set(true);
 
-        #[cfg(feature = "profiler")]
-        {
-            self.window_profiler
-                .set_refresh_interval(self.refresh_interval(cx));
-            let draw_duration = self
-                .window_profiler
-                .end_draw(frame_dirty.dirty_at, frame_dirty.invalidations);
-            self.debug_frame_overlay.record_frame(draw_duration);
-        }
-
-        // Exit the scope to obtain the arena-clear token this draw owes; the
-        // scope's teardown itself happens in `ElementArenaScope::drop`.
         arena_scope.exit(&cx.element_arena)
     }
 
@@ -3792,7 +3904,9 @@ impl Window {
         self.a11y.sync_active_flag();
         let a11y_active_end_of_frame = self.a11y.is_active();
 
-        let should_send_a11y_update = a11y_active_start_of_frame && a11y_active_end_of_frame;
+        let should_send_a11y_update = a11y_active_start_of_frame
+            && a11y_active_end_of_frame
+            && self.fade_cache_invalidations.is_empty();
 
         if a11y_active_start_of_frame {
             // Harvest frame metadata for the debug dump while the live window
@@ -4245,6 +4359,28 @@ impl Window {
         result
     }
 
+    /// Runs `f` with an edge fade. The innermost active fade wins; `None`
+    /// or a fade with no enabled edges leaves the current scope unchanged.
+    /// Quads and sprites fade per pixel; paths, shadows and decorations use
+    /// conservative primitive opacity.
+    pub fn with_edge_fade<R>(
+        &mut self,
+        fade: Option<EdgeFade>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let Some(fade) = fade else {
+            return f(self);
+        };
+        if !(fade.top || fade.bottom || fade.left || fade.right) {
+            return f(self);
+        }
+        self.invalidator.debug_assert_paint_or_prepaint();
+        let previous = self.edge_fade.replace(fade);
+        let result = f(self);
+        self.edge_fade = previous;
+        result
+    }
+
     /// Perform prepaint on child elements in a "retryable" manner, so that any side effects
     /// of prepaints can be discarded before prepainting again. This is used to support autoscroll
     /// where we need to prepaint children to detect the autoscroll bounds, then adjust the
@@ -4323,6 +4459,92 @@ impl Window {
     pub(crate) fn element_opacity(&self) -> f32 {
         self.invalidator.debug_assert_paint_or_prepaint();
         self.element_opacity
+    }
+
+    fn element_opacity_at(&self, position: Point<Pixels>) -> f32 {
+        let opacity = self.element_opacity();
+        let Some(fade) = &self.edge_fade else {
+            return opacity;
+        };
+        let mut ramp: f32 = 1.0;
+        if fade.top {
+            ramp =
+                ramp.min(((position.y.0 - fade.bounds.top().0) / fade.top_band()).clamp(0.0, 1.0));
+        }
+        if fade.bottom {
+            ramp = ramp.min(
+                ((fade.bounds.bottom().0 - position.y.0) / fade.bottom_band()).clamp(0.0, 1.0),
+            );
+        }
+        if fade.left {
+            ramp = ramp
+                .min(((position.x.0 - fade.bounds.left().0) / fade.left_band()).clamp(0.0, 1.0));
+        }
+        if fade.right {
+            ramp = ramp
+                .min(((fade.bounds.right().0 - position.x.0) / fade.right_band()).clamp(0.0, 1.0));
+        }
+        opacity * ramp * ramp
+    }
+
+    fn element_opacity_for_bounds(&self, bounds: &Bounds<Pixels>) -> f32 {
+        let opacity = self.element_opacity();
+        let Some(fade) = &self.edge_fade else {
+            return opacity;
+        };
+        let mut ramp: f32 = 1.0;
+        if fade.top {
+            ramp = ramp
+                .min(((bounds.top().0 - fade.bounds.top().0) / fade.top_band()).clamp(0.0, 1.0));
+        }
+        if fade.bottom {
+            ramp = ramp.min(
+                ((fade.bounds.bottom().0 - bounds.bottom().0) / fade.bottom_band()).clamp(0.0, 1.0),
+            );
+        }
+        if fade.left {
+            ramp = ramp
+                .min(((bounds.left().0 - fade.bounds.left().0) / fade.left_band()).clamp(0.0, 1.0));
+        }
+        if fade.right {
+            ramp = ramp.min(
+                ((fade.bounds.right().0 - bounds.right().0) / fade.right_band()).clamp(0.0, 1.0),
+            );
+        }
+        opacity * ramp * ramp
+    }
+
+    fn scaled_edge_fade(&self) -> crate::EdgeFadeParams {
+        let Some(fade) = &self.edge_fade else {
+            return Default::default();
+        };
+        let scale = self.scale_factor();
+        crate::EdgeFadeParams {
+            top_y: fade.bounds.top().0 * scale,
+            bottom_y: fade.bounds.bottom().0 * scale,
+            band_top: if fade.top {
+                fade.top_band() * scale
+            } else {
+                0.0
+            },
+            band_bottom: if fade.bottom {
+                fade.bottom_band() * scale
+            } else {
+                0.0
+            },
+            left_x: fade.bounds.left().0 * scale,
+            right_x: fade.bounds.right().0 * scale,
+            band_left: if fade.left {
+                fade.left_band() * scale
+            } else {
+                0.0
+            },
+            band_right: if fade.right {
+                fade.right_band() * scale
+            } else {
+                0.0
+            },
+        }
     }
 
     /// Obtain the current content mask. This method should only be called during element drawing.
@@ -4583,7 +4805,7 @@ impl Window {
 
         let scale_factor = self.scale_factor();
         let content_mask = self.snapped_content_mask();
-        let opacity = self.element_opacity();
+        let opacity = self.element_opacity_for_bounds(&bounds);
         let element_bounds = self.cover_bounds(bounds);
         let element_corner_radii = corner_radii.scale(scale_factor);
         for shadow in shadows {
@@ -4619,7 +4841,7 @@ impl Window {
 
         let scale_factor = self.scale_factor();
         let content_mask = self.snapped_content_mask();
-        let opacity = self.element_opacity();
+        let opacity = self.element_opacity_for_bounds(&bounds);
         let element_bounds = self.cover_bounds(bounds);
         let element_corner_radii = corner_radii.scale(scale_factor);
         for shadow in shadows {
@@ -4714,6 +4936,7 @@ impl Window {
             corner_radii: quad.corner_radii.scale(self.scale_factor()),
             border_widths: snapped_border_widths,
             border_style: quad.border_style,
+            fade: self.scaled_edge_fade(),
         };
 
         if !quad.background.is_transparent() {
@@ -4775,7 +4998,7 @@ impl Window {
 
         let scale_factor = self.scale_factor();
         let content_mask = self.content_mask();
-        let opacity = self.element_opacity();
+        let opacity = self.element_opacity_for_bounds(&path.bounds);
         path.content_mask = content_mask;
         let color: Background = color.into();
         path.color = color.opacity(opacity);
@@ -4815,7 +5038,7 @@ impl Window {
             origin: origin.map(|c| ScaledPixels(round_to_device_pixel(c.0, scale_factor))),
             size: size(self.snap_stroke(width), self.snap_stroke(height)),
         };
-        let opacity = self.element_opacity();
+        let opacity = self.element_opacity_at(origin);
 
         self.next_frame.scene.insert_primitive(Underline {
             order: 0,
@@ -4898,6 +5121,7 @@ impl Window {
                     color: color.opacity(element_opacity),
                     tile,
                     transformation: TransformationMatrix::unit(),
+                    fade: self.scaled_edge_fade(),
                 });
             } else {
                 self.next_frame.scene.insert_primitive(MonochromeSprite {
@@ -4908,6 +5132,7 @@ impl Window {
                     color: color.opacity(element_opacity),
                     tile,
                     transformation: TransformationMatrix::unit(),
+                    fade: self.scaled_edge_fade(),
                 });
             }
         }
@@ -4990,6 +5215,7 @@ impl Window {
                 content_mask,
                 tile,
                 opacity,
+                fade: self.scaled_edge_fade(),
             });
         }
         Ok(())
@@ -5055,6 +5281,7 @@ impl Window {
             color: color.opacity(element_opacity),
             tile,
             transformation,
+            fade: self.scaled_edge_fade(),
         });
 
         Ok(())
@@ -5162,6 +5389,7 @@ impl Window {
             corner_radii,
             tile: sub_tile,
             opacity,
+            fade: self.scaled_edge_fade(),
         });
         Ok(())
     }
@@ -9440,6 +9668,186 @@ mod tests {
         cx.executor().advance_clock(Duration::from_millis(250));
         cx.executor().run_until_parked();
         assert_eq!(phases.borrow().as_slice(), [TouchPhase::Started]);
+    }
+
+    #[gpui::test]
+    fn edge_fade_scopes_restore_and_write_scaled_scene_params(cx: &mut TestAppContext) {
+        use crate::{EdgeFade, EdgeFadeParams, RenderImage, fill};
+        use std::sync::Arc;
+
+        test_underline_paint_at_scales(cx, |window| {
+            let scale = window.scale_factor();
+            let outer = EdgeFade {
+                bounds: Bounds::new(point(px(10.), px(20.)), size(px(100.), px(80.))),
+                band: px(10.),
+                band_top: Some(px(20.)),
+                band_bottom: Some(px(0.25)),
+                band_left: None,
+                band_right: Some(px(5.)),
+                top: true,
+                bottom: true,
+                left: true,
+                right: false,
+            };
+            let inner = EdgeFade {
+                top: false,
+                bottom: false,
+                left: false,
+                right: true,
+                band_right: Some(px(4.)),
+                ..outer
+            };
+            let inactive = EdgeFade {
+                right: false,
+                ..inner
+            };
+            let outer_params = EdgeFadeParams {
+                top_y: 20. * scale,
+                bottom_y: 100. * scale,
+                band_top: 20. * scale,
+                band_bottom: scale,
+                left_x: 10. * scale,
+                right_x: 110. * scale,
+                band_left: 10. * scale,
+                band_right: 0.,
+            };
+            let inner_params = EdgeFadeParams {
+                band_top: 0.,
+                band_bottom: 0.,
+                band_left: 0.,
+                band_right: 4. * scale,
+                ..outer_params
+            };
+            let bounds = Bounds::new(point(px(15.), px(30.)), size(px(30.), px(20.)));
+            let color = hsla(0.2, 0.4, 0.6, 0.8);
+            let image = Arc::new(RenderImage::new(smallvec::smallvec![image::Frame::new(
+                image::RgbaImage::from_pixel(4, 4, image::Rgba([255, 255, 255, 255])),
+            )]));
+            window.next_frame.scene.clear();
+            window.paint_quad(fill(bounds, color));
+            let result = window.with_element_opacity(Some(0.5), |window| {
+                window.with_edge_fade(Some(outer), |window| {
+                    window.paint_quad(fill(bounds, color));
+                    window
+                        .paint_image(bounds, bounds, Default::default(), image.clone(), 0, false)
+                        .unwrap();
+                    assert_eq!(window.element_opacity_at(point(px(15.), px(30.))), 0.125);
+                    assert_eq!(window.element_opacity_at(point(px(40.), px(99.5))), 0.125);
+                    assert_eq!(window.element_opacity_at(point(px(40.), px(100.))), 0.);
+                    assert_eq!(window.element_opacity_for_bounds(&bounds), 0.125);
+                    assert_eq!(
+                        window.with_edge_fade(None, |window| {
+                            window.paint_quad(fill(bounds, color));
+                            17
+                        }),
+                        17
+                    );
+                    window.with_edge_fade(Some(inactive), |window| {
+                        window.paint_quad(fill(bounds, color))
+                    });
+                    window.with_edge_fade(Some(inner), |window| {
+                        window.paint_quad(fill(bounds, color));
+                        window
+                            .paint_image(
+                                bounds,
+                                bounds,
+                                Default::default(),
+                                image.clone(),
+                                0,
+                                false,
+                            )
+                            .unwrap();
+                        assert_eq!(window.element_opacity_at(point(px(108.), px(50.))), 0.125);
+                    });
+                    window.paint_quad(fill(bounds, color));
+                    23
+                })
+            });
+            assert_eq!(result, 23);
+            window.paint_quad(fill(bounds, color));
+            let quads = &window.next_frame.scene.quads;
+            assert_eq!(quads.len(), 7);
+            assert_eq!(
+                quads.iter().map(|quad| quad.fade).collect::<Vec<_>>(),
+                [
+                    EdgeFadeParams::default(),
+                    outer_params,
+                    outer_params,
+                    outer_params,
+                    inner_params,
+                    outer_params,
+                    EdgeFadeParams::default(),
+                ]
+            );
+            assert_eq!(quads[1].background.as_solid().unwrap().a, 0.4);
+            let sprites = &window.next_frame.scene.polychrome_sprites;
+            assert_eq!(sprites.len(), 2);
+            assert_eq!(sprites[0].fade, outer_params);
+            assert_eq!(sprites[1].fade, inner_params);
+            assert_eq!(sprites[0].opacity, 0.5);
+            assert_eq!(window.edge_fade, None);
+            assert_eq!(window.element_opacity(), 1.);
+        });
+    }
+
+    #[gpui::test]
+    fn edge_fade_applies_conservative_opacity_to_paths_shadows_and_decorations(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::{BoxShadow, EdgeFade, Path, StrikethroughStyle};
+
+        test_underline_paint_at_scales(cx, |window| {
+            let fade = EdgeFade {
+                bounds: Bounds::new(point(px(10.), px(20.)), size(px(100.), px(80.))),
+                band: px(10.),
+                band_top: Some(px(20.)),
+                band_bottom: None,
+                band_left: None,
+                band_right: None,
+                top: true,
+                bottom: false,
+                left: true,
+                right: false,
+            };
+            let origin = point(px(15.), px(30.));
+            let bounds = Bounds::new(origin, size(px(20.), px(10.)));
+            let color = hsla(0.2, 0.4, 0.6, 0.8);
+            let style = UnderlineStyle {
+                thickness: px(1.),
+                color: Some(color),
+                wavy: false,
+            };
+            let strikethrough = StrikethroughStyle {
+                thickness: px(1.),
+                color: Some(color),
+            };
+            let mut path = Path::new(origin);
+            path.push_triangle(
+                (origin, point(px(35.), px(30.)), point(px(15.), px(40.))),
+                (point(0., 1.), point(0., 1.), point(0., 1.)),
+            );
+            let drop_shadow = BoxShadow::new(px(0.), px(0.), color);
+            let inset_shadow = drop_shadow.clone().inset();
+            window.next_frame.scene.clear();
+            window.with_element_opacity(Some(0.5), |window| {
+                window.with_edge_fade(Some(fade), |window| {
+                    window.paint_underline_with_exclusions(origin, px(20.), &style, &[]);
+                    window.paint_strikethrough(origin, px(20.), &strikethrough);
+                    window.paint_path(path, color);
+                    window.paint_drop_shadows(bounds, Default::default(), &[drop_shadow]);
+                    window.paint_inset_shadows(bounds, Default::default(), &[inset_shadow]);
+                });
+            });
+            let scene = &window.next_frame.scene;
+            assert_eq!(scene.underlines.len(), 2);
+            assert_eq!(scene.underlines[0].color.a, 0.1);
+            assert_eq!(scene.underlines[1].color.a, 0.1);
+            assert_eq!(scene.paths.len(), 1);
+            assert_eq!(scene.paths[0].color.as_solid().unwrap().a, 0.1);
+            assert_eq!(scene.shadows.len(), 2);
+            assert_eq!(scene.shadows[0].color.a, 0.1);
+            assert_eq!(scene.shadows[1].color.a, 0.1);
+        });
     }
 
     #[gpui::test]

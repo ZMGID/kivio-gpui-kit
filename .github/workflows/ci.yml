@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - kivio
     tags:
       - "*"
       # `shell-<tag>` only records which commit a release's gpui-shell
@@ -20,6 +21,7 @@ env:
   # dependency cache small enough to stay under the repository's 10 GB cache
   # limit instead of being evicted before the next run can use it.
   CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
 
 # Every job that compiles Rust relies on the dependency cache that
 # `actions-rust-lang/setup-rust-toolchain` installs (Swatinem/rust-cache).
@@ -154,6 +156,28 @@ jobs:
           cargo test --workspace --exclude gpui-shell
           --features gpui-component-story/test-support --locked
           $TEST_EXCLUDES --test rendering
+      - name: GPUI fork core regressions
+        run: >-
+          cargo test --manifest-path gpui-pre/gpui-pre/Cargo.toml
+          --target-dir target --features test-support,profiler --lib
+      - name: DirectX fork pixel regressions
+        if: ${{ matrix.run_on == 'windows-latest' }}
+        run: >-
+          cargo test --manifest-path gpui-pre/gpui-pre-windows/Cargo.toml
+          --target-dir target --features test-support --lib
+          --config "patch.crates-io.gpui-pre.path='$(pwd -W)/gpui-pre/gpui-pre'"
+      - name: WGPU fork pixel regressions
+        if: ${{ matrix.run_on == 'ubuntu-latest' }}
+        run: >-
+          cargo test --manifest-path gpui-pre/gpui-pre-wgpu/Cargo.toml
+          --target-dir target --features test-support --lib
+          --config "patch.crates-io.gpui-pre.path='$PWD/gpui-pre/gpui-pre'"
+      - name: Metal fork regressions
+        if: ${{ matrix.run_on == 'macos-latest' }}
+        run: >-
+          cargo test --manifest-path gpui-pre/gpui-pre-apple/Cargo.toml
+          --target-dir target --features runtime_shaders,test-support --lib
+          --config "patch.crates-io.gpui-pre.path='$PWD/gpui-pre/gpui-pre'"
 
   gpui-fast:
     name: GPUI Fast (${{ matrix.run_on }})

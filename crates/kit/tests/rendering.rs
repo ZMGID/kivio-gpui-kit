@@ -697,6 +697,138 @@ mod rendering {
         handle
     }
 
+    #[cfg(not(feature = "gpui-fast"))]
+    const EVICTION_IMAGE: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><rect width="8" height="8" fill="#ff0000"/></svg>"##;
+
+    #[cfg(not(feature = "gpui-fast"))]
+    struct EvictionAssets;
+    #[cfg(not(feature = "gpui-fast"))]
+    impl AssetSource for EvictionAssets {
+        fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
+            if path == "eviction-test.svg" {
+                Ok(Some(Cow::Borrowed(EVICTION_IMAGE)))
+            } else {
+                Assets.load(path)
+            }
+        }
+
+        fn list(&self, path: &str) -> Result<Vec<SharedString>> {
+            Assets.list(path)
+        }
+    }
+
+    #[cfg(not(feature = "gpui-fast"))]
+    struct EvictionImage(Arc<gpui_kit::RenderImage>);
+    #[cfg(not(feature = "gpui-fast"))]
+    impl Render for EvictionImage {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .child(gpui_kit::img(self.0.clone()).size_full())
+        }
+    }
+
+    #[cfg(not(feature = "gpui-fast"))]
+    fn assert_red_image(cx: &mut HeadlessAppContext, handle: gpui_kit::AnyWindowHandle) {
+        let capture = cx.capture_screenshot(handle).expect("GPU screenshot");
+        let pixel = capture
+            .get_pixel(capture.width() / 2, capture.height() / 2)
+            .0;
+        assert!(
+            pixel[0] > 200 && pixel[1] < 60 && pixel[2] < 60,
+            "{pixel:?}"
+        );
+    }
+
+    #[cfg(not(feature = "gpui-fast"))]
+    fn exercise_gpu_eviction(
+        cx: &mut HeadlessAppContext,
+        source: gpui_kit::ImageSource,
+        image: Arc<gpui_kit::RenderImage>,
+    ) -> gpui_kit::AnyWindowHandle {
+        let first = open_window(cx, (32., 32.), {
+            let image = image.clone();
+            move |_, _| EvictionImage(image)
+        });
+        let second = open_window(cx, (32., 32.), {
+            let image = image.clone();
+            move |_, _| EvictionImage(image)
+        });
+        for handle in [first, second] {
+            cx.update_window(handle, |_, window, cx| {
+                assert!(source.is_asset_cached(cx));
+                assert!(window.has_image_atlas_entry(&image));
+            })
+            .unwrap();
+            assert_red_image(cx, handle);
+        }
+
+        cx.update_window(first, |_, window, cx| {
+            source.evict(Some(window), cx);
+            assert!(!source.is_asset_cached(cx));
+            assert!(!window.has_image_atlas_entry(&image));
+        })
+        .unwrap();
+        cx.update_window(second, |_, window, _| {
+            assert!(!window.has_image_atlas_entry(&image));
+        })
+        .unwrap();
+
+        for handle in [first, second] {
+            cx.update_window(handle, |_, window, cx| {
+                window.refresh();
+                window.render_frame(cx);
+                assert!(window.has_image_atlas_entry(&image));
+            })
+            .unwrap();
+            assert_red_image(cx, handle);
+        }
+        cx.update(|cx| gpui_kit::ImageSource::Render(image.clone()).evict(None, cx));
+        for handle in [first, second] {
+            cx.update_window(handle, |_, window, _| {
+                assert!(!window.has_image_atlas_entry(&image));
+            })
+            .unwrap();
+        }
+        first
+    }
+
+    #[cfg(not(feature = "gpui-fast"))]
+    fn image_eviction_releases_gpu_atlas_entries_and_reuploads() {
+        let mut cx = context(Arc::new(EvictionAssets));
+        let resource = gpui_kit::Resource::Embedded("eviction-test.svg".into());
+        cx.update(|cx| {
+            assert!(
+                cx.fetch_asset::<gpui_kit::ImgResourceLoader>(&resource)
+                    .is_none()
+            )
+        });
+        cx.run_until_parked();
+        let decoded = cx.update(|cx| {
+            cx.peek_asset::<gpui_kit::ImgResourceLoader>(&resource)
+                .unwrap()
+                .unwrap()
+        });
+        let first =
+            exercise_gpu_eviction(&mut cx, gpui_kit::ImageSource::Resource(resource), decoded);
+
+        let image = Arc::new(gpui_kit::Image::from_bytes(
+            gpui_kit::ImageFormat::Svg,
+            EVICTION_IMAGE.to_vec(),
+        ));
+        cx.update_window(first, |_, window, cx| {
+            assert!(image.clone().get_render_image(window, cx).is_none());
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let decoded = cx
+            .update_window(first, |_, window, cx| {
+                image.clone().get_render_image(window, cx).unwrap()
+            })
+            .unwrap();
+        exercise_gpu_eviction(&mut cx, gpui_kit::ImageSource::Image(image), decoded);
+    }
+
     /// Whether the fill just inside the left edge of `row` differs from `idle`,
     /// that is, whether the row is highlighted. The sample sits in the row's
     /// padding, clear of its label.
@@ -1038,11 +1170,20 @@ mod rendering {
         println!("running list_selection_is_the_keyboard_cursor");
         list_selection_is_the_keyboard_cursor();
         println!("passed list_selection_is_the_keyboard_cursor");
+        #[cfg(not(feature = "gpui-fast"))]
+        {
+            println!("running image_eviction_releases_gpu_atlas_entries_and_reuploads");
+            image_eviction_releases_gpu_atlas_entries_and_reuploads();
+            println!("passed image_eviction_releases_gpu_atlas_entries_and_reuploads");
+        }
         for focus_ring in [false, true] {
             println!("running table_shows_keyboard_focus_only (focus_ring = {focus_ring})");
             table_shows_keyboard_focus_only(focus_ring);
             println!("passed table_shows_keyboard_focus_only (focus_ring = {focus_ring})");
         }
+        #[cfg(not(feature = "gpui-fast"))]
+        println!("rendering: 14 passed (real offscreen renderer)");
+        #[cfg(feature = "gpui-fast")]
         println!("rendering: 13 passed (real offscreen renderer)");
     }
 }

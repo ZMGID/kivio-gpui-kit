@@ -85,6 +85,8 @@ Review follow-up verification on Windows: DirectX WARP 52 passed, WGPU 75 passed
 
 Media-border review verification: component 738 unit and 50 integration tests passed on Windows. Scene regressions compare ordinary `Div` and media paint, asymmetric radii/borders, opacity, descendant clipping, and failed-image retry interaction at fractional or doubled scale. New real-pixel attachment cases live in `crates/kit/tests/rendering.rs`; that harness runs on Metal/Linux WGPU, not Windows.
 
+The pixel fixture's plain `Div` wrappers explicitly opt into `.test_support()` before `Window::find`; an element ID alone does not register observations. Corner samples use the captured device scale rather than asserting the harness's incidental default scale (`test(render): register media pixel fixture observations`).
+
 ### Markdown reference resolution
 
 AST conversion collects definitions in document order before converting blocks, keeps the first definition for a normalized label, and resolves link marks and reference images while that context is available. A `TextView` no longer depends on discarded parser context to recover a link's URL at paint time. No new public context API or renderer state is added.

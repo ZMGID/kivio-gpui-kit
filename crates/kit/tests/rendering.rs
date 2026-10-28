@@ -711,7 +711,7 @@ mod rendering {
                     .bg(gpui_kit::rgb(0x0000ff))
             }
 
-            use gpui_kit::component::attachment::AttachmentMedia;
+            use gpui_kit::{component::attachment::AttachmentMedia, test::TestSupportExt};
 
             div()
                 .size_full()
@@ -720,25 +720,38 @@ mod rendering {
                 .items_start()
                 .gap(px(8.))
                 .p(px(8.))
-                .child(div().id("media-child").size(px(64.)).child(border(
-                    AttachmentMedia::new().child(div().size_full().bg(gpui_kit::rgb(0x0000ff))),
-                )))
                 .child(
-                    div().id("plain-child").size(px(64.)).child(border(
-                        div()
-                            .overflow_hidden()
-                            .child(div().size_full().bg(gpui_kit::rgb(0x0000ff))),
-                    )),
+                    div()
+                        .id("media-child")
+                        .test_support()
+                        .size(px(64.))
+                        .child(border(
+                            AttachmentMedia::new()
+                                .child(div().size_full().bg(gpui_kit::rgb(0x0000ff))),
+                        )),
+                )
+                .child(
+                    div()
+                        .id("plain-child")
+                        .test_support()
+                        .size(px(64.))
+                        .child(border(
+                            div()
+                                .overflow_hidden()
+                                .child(div().size_full().bg(gpui_kit::rgb(0x0000ff))),
+                        )),
                 )
                 .child(
                     div()
                         .id("media-empty")
+                        .test_support()
                         .size(px(64.))
                         .child(border(AttachmentMedia::new()).border(px(0.))),
                 )
                 .child(
                     div()
                         .id("plain-empty")
+                        .test_support()
                         .size(px(64.))
                         .child(border(div().overflow_hidden()).border(px(0.))),
                 )
@@ -756,7 +769,6 @@ mod rendering {
             })
             .unwrap();
         let capture = Capture::take(&mut cx, handle);
-        assert_eq!(capture.scale(), 2.);
         let pixel = |index: usize, x: i32, y: i32| {
             capture.get_pixel(
                 capture.device(bounds[index].left()) + x,
@@ -764,27 +776,27 @@ mod rendering {
             )
         };
         for index in [0, 1] {
-            let arc = pixel(index, 11, 11);
+            let arc_offset = capture.device(px(5.5));
+            let arc = pixel(index, arc_offset, arc_offset);
             assert!(
                 arc[0] > 230 && arc[1] < 16 && arc[2] < 16,
                 "rounded border arc must remain visible above content: {arc:?}"
             );
         }
-        let edge = pixel(3, 9, 9);
-        assert!(
-            edge[2] > 0 && edge[2] < 255,
-            "expected antialiased fill: {edge:?}"
-        );
-        for y in 0..32 {
-            for x in 0..32 {
+        let corner_size = capture.device(px(16.));
+        let mut antialiased_fill = false;
+        for y in 0..corner_size {
+            for x in 0..corner_size {
                 let media = pixel(2, x, y);
                 let plain = pixel(3, x, y);
+                antialiased_fill |= plain[2] > 0 && plain[2] < 255;
                 assert!(
                     media.iter().zip(plain).all(|(a, b)| (a - b).abs() <= 2),
                     "media corner ({x},{y})={media:?}, plain={plain:?}"
                 );
             }
         }
+        assert!(antialiased_fill, "expected antialiased fill");
     }
 
     #[cfg(not(feature = "gpui-fast"))]

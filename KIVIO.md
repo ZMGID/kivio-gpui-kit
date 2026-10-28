@@ -60,4 +60,6 @@ CI compatibility fixes use the nondeprecated atomic `try_update` API (also compi
 
 Clipboard projections retain selected leading/trailing whitespace, blank lines and whitespace-only participants. Existing selection, reflow and copy-before-paint regressions now assert that exact projection rather than trimming it. The real drag/shortcut regression includes padded and whitespace-only plain text. Windows verification: all 1,490 base tests passed; all 425 Kit tests passed with native GPUI and again with `gpui-fast`. The full CI matrix is rerun after this clipboard contract migration.
 
+The standalone Metal regression suite requires CoreVideo's `CVBase` feature for pixel-buffer lock flags and lock/unlock APIs. Enable it explicitly on the existing `objc2-core-video` dependency; the full workspace build did not compile these backend-local tests.
+
 Licensed under Apache-2.0, same as upstream (see `LICENSE-APACHE`).

@@ -56,4 +56,6 @@ Test prerequisites (`e658617`) restore the published core tests without the unpu
 
 The WGPU font-family regression uses the existing full and subset IBM Plex Sans faces plus Lilex Regular; it does not require an unavailable Lilex Bold file. Its standalone Windows run passed 45 tests (font, atlas, shader and layout checks); Linux-only WGPU pixel tests are not included in that result.
 
+CI compatibility fixes use the nondeprecated atomic `try_update` API (also compiled and exercised on Kivio's Rust 1.96), comma-separated Objective-C selectors, and no unused blur field on `gpui-fast`. Strict `-D warnings` verification passed 69 profiler tests and the fast component check. The typo vocabulary preserves native ABI names rather than renaming them; the renderer's actual prose typo is corrected.
+
 Licensed under Apache-2.0, same as upstream (see `LICENSE-APACHE`).

@@ -11,6 +11,7 @@ use gpui::{
 /// The optional `gpui-fast` backend has no backdrop API and keeps the defaults.
 #[derive(Clone, Copy)]
 pub struct OverlayBackdrop {
+    #[cfg(not(feature = "gpui-fast"))]
     blur_radius: Pixels,
     tint_opacity: f32,
 }
@@ -18,7 +19,10 @@ pub struct OverlayBackdrop {
 impl OverlayBackdrop {
     /// Set the Gaussian sigma in logical pixels and the theme tint's opacity.
     pub fn new(blur_radius: Pixels, tint_opacity: f32) -> Self {
+        #[cfg(feature = "gpui-fast")]
+        let _ = blur_radius;
         Self {
+            #[cfg(not(feature = "gpui-fast"))]
             blur_radius,
             tint_opacity: tint_opacity.clamp(0., 1.),
         }

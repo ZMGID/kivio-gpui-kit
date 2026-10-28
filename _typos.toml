@@ -27,6 +27,13 @@ backgrund = "backgrund"
 wtach = "wtach"
 netwrok = "netwrok"
 workspce = "workspce"
+# Native ABI vocabulary: numerator, mouse tracking, target device, LOD and AMD GPU Services.
+numer = "numer"
+TME = "TME"
+ptd = "ptd"
+LOD = "LOD"
+AGS = "AGS"
+ags = "ags"
 
 [files]
 extend-exclude = ["crates/story/src/fixtures/"]

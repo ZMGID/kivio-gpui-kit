@@ -972,8 +972,8 @@ impl MetalRenderer {
         unsafe {
             let _: () = msg_send![
                 kernel,
-                encodeToCommandBuffer: command_buffer.as_ptr().cast::<AnyObject>()
-                sourceTexture: scratch.as_ptr().cast::<AnyObject>()
+                encodeToCommandBuffer: command_buffer.as_ptr().cast::<AnyObject>(),
+                sourceTexture: scratch.as_ptr().cast::<AnyObject>(),
                 destinationTexture: blurred.as_ptr().cast::<AnyObject>()
             ];
         }
@@ -1097,7 +1097,7 @@ impl MetalRenderer {
                 let allocated: *mut AnyObject = msg_send![class!(MPSImageGaussianBlur), alloc];
                 let kernel: *mut AnyObject = msg_send![
                     allocated,
-                    initWithDevice: self.device.as_ptr().cast::<AnyObject>()
+                    initWithDevice: self.device.as_ptr().cast::<AnyObject>(),
                     sigma: sigma
                 ];
                 let kernel =

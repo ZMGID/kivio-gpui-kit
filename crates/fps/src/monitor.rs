@@ -131,7 +131,7 @@ const DEFAULT_FONT: &str = "monospace";
 /// # }
 /// ```
 /// The numbers as last published to the screen.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct Readout {
     /// The rate a full redraw of this window could sustain: the reciprocal of
     /// `frame_millis`.
@@ -229,6 +229,7 @@ pub struct FpsMonitor {
     /// Held while the HUD is shown, so a hidden HUD does not keep GPUI
     /// recording every frame into the trace buffer.
     frame_trace: Option<FrameTraceGuard>,
+    finished: bool,
 }
 
 /// Tells a hidden HUD from a shown one by whether anything has rendered it
@@ -278,7 +279,29 @@ impl FpsMonitor {
             frames_rendered: 0,
             clock: None,
             frame_trace: Some(FrameTraceGuard::acquire()),
+            finished: false,
         }
+    }
+
+    /// Drain pending traced frames and publish the final retained readings.
+    ///
+    /// The chart and readings stay fixed on later renders, and the clock and
+    /// this monitor's trace guard are released. Repeated calls have no effect;
+    /// create a new monitor to measure another run.
+    pub fn finish(&mut self, cx: &mut Context<Self>) {
+        if self.finished {
+            return;
+        }
+        if self.frame_trace.is_some() {
+            self.sampler.tick();
+        }
+        self.readout_at = None;
+        self.update_readout();
+        self.update_axis();
+        self.finished = true;
+        self.clock = None;
+        self.frame_trace = None;
+        cx.notify();
     }
 
     /// Counts a render, which is what keeps the clock running, and brings a HUD
@@ -322,6 +345,9 @@ impl FpsMonitor {
 
     /// Pins the budget: the display's refresh period no longer replaces it.
     pub(crate) fn set_frame_budget(&mut self, budget: Duration) {
+        if self.finished {
+            return;
+        }
         self.budget_explicit = true;
         self.apply_budget(budget);
     }
@@ -652,12 +678,14 @@ impl FpsMonitor {
 
 impl Render for FpsMonitor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.wake();
-        self.sampler.tick();
-        self.update_display(window, cx);
-        self.update_readout();
-        self.update_axis();
-        self.start_clock(cx);
+        if !self.finished {
+            self.wake();
+            self.sampler.tick();
+            self.update_display(window, cx);
+            self.update_readout();
+            self.update_axis();
+            self.start_clock(cx);
+        }
 
         let style = self.style;
         let budget = self.frame_budget;
@@ -1016,6 +1044,136 @@ mod tests {
                 monitor.wake();
                 assert!(monitor.frame_trace.is_some());
                 assert_eq!(monitor.frames_rendered, rendered + 1);
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn finishing_publishes_pending_frames_and_freezes_the_hud(cx: &mut TestAppContext) {
+        use std::{cell::Cell, rc::Rc};
+
+        use gpui::profiler::{FrameEvent, FrameTiming, record_frame_event};
+
+        let cx = cx.add_empty_window();
+        // Another profiler may keep the process-wide trace active after finish.
+        let _other_trace = FrameTraceGuard::acquire();
+        let window_id = gpui::WindowId::from(0xF005_0001);
+        let record = |window_id, millis| {
+            let start = std::time::Instant::now();
+            record_frame_event(FrameEvent::Draw(FrameTiming {
+                window_id,
+                dirty_at: None,
+                invalidations: 1,
+                draw_start: start,
+                draw_end: start + Duration::from_millis(millis),
+                refresh_interval: None,
+                signal_at: None,
+                phases: Default::default(),
+            }));
+        };
+        let notifications = Rc::new(Cell::new(0));
+        let (monitor, _observer) = cx.update(|window, cx| {
+            let monitor = cx.new(|cx| FpsMonitor::new(window, cx).show_resources(false));
+            monitor.update(cx, |monitor, cx| {
+                monitor.sampler = FrameSampler::new(window_id, DEFAULT_CAPACITY);
+                let _ = monitor.render(window, cx);
+                assert!(monitor.clock.is_some());
+            });
+            let count = notifications.clone();
+            let observer = cx.observe(&monitor, move |_, _| count.set(count.get() + 1));
+            (monitor, observer)
+        });
+        cx.run_until_parked();
+
+        let frozen = cx.update(|window, cx| {
+            for _ in 0..8 {
+                record(window_id, 4);
+            }
+            for _ in 0..9 {
+                record(window_id, 4);
+            }
+            monitor.update(cx, |monitor, cx| {
+                monitor.readout_at = None;
+                let _ = monitor.render(window, cx);
+                assert_eq!(monitor.readout.percentile_millis, 4.);
+                assert_eq!(monitor.sampler.samples().len(), 9);
+            });
+
+            // The last frame has not yet been read or published.
+            record(window_id, 50);
+            monitor.update(cx, |monitor, cx| {
+                monitor.resources = Some(ResourceSample {
+                    cpu_percent: 12.,
+                    memory_bytes: 123_000,
+                    gpu_percent: Some(3.),
+                });
+                monitor.show_resources = true;
+                monitor.finish(cx);
+                assert_eq!(monitor.readout.percentile_millis, 50.);
+                assert!((monitor.readout.frame_millis - 8.6).abs() < 0.001);
+                assert!((monitor.readout.dropped_percent - 10.).abs() < 0.001);
+                assert_eq!(
+                    monitor.sampler.samples().last().unwrap().draw,
+                    Duration::from_millis(50)
+                );
+                assert_eq!(monitor.axis_max, 0.05);
+                assert!(monitor.clock.is_none());
+                assert!(monitor.frame_trace.is_none());
+                (
+                    monitor.readout,
+                    monitor.axis_max,
+                    monitor.sampler.samples().copied().collect::<Vec<_>>(),
+                    monitor.frame_budget,
+                    monitor.resources,
+                )
+            })
+        });
+        cx.run_until_parked();
+        let notifications_after_finish = notifications.get();
+        assert!(notifications_after_finish > 0);
+        assert!(gpui::profiler::trace_enabled());
+
+        cx.update(|window, cx| {
+            for _ in 0..20 {
+                record(window_id, 200);
+            }
+            monitor.update(cx, |monitor, cx| {
+                monitor.set_frame_budget(Duration::from_millis(5));
+                let _ = monitor.render(window, cx);
+                let _ = monitor.render(window, cx);
+                monitor.finish(cx);
+                assert_eq!(monitor.readout, frozen.0);
+                assert_eq!(monitor.axis_max, frozen.1);
+                assert_eq!(
+                    monitor.sampler.samples().copied().collect::<Vec<_>>(),
+                    frozen.2
+                );
+                assert_eq!(monitor.frame_budget, frozen.3);
+                assert_eq!(monitor.resources, frozen.4);
+                assert!(monitor.clock.is_none());
+                assert!(monitor.frame_trace.is_none());
+            });
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+        assert_eq!(notifications.get(), notifications_after_finish);
+
+        let fresh_id = gpui::WindowId::from(0xF005_0002);
+        cx.update(|window, cx| {
+            let fresh = cx.new(|cx| FpsMonitor::new(window, cx).show_resources(false));
+            fresh.update(cx, |monitor, cx| {
+                monitor.sampler = FrameSampler::new(fresh_id, DEFAULT_CAPACITY);
+                let _ = monitor.render(window, cx);
+            });
+            for _ in 0..18 {
+                record(fresh_id, 7);
+            }
+            fresh.update(cx, |monitor, cx| {
+                monitor.finish(cx);
+                assert_eq!(monitor.readout.percentile_millis, 7.);
+                assert_eq!(monitor.readout.dropped_percent, 0.);
+                assert_eq!(monitor.sampler.samples().len(), 10);
             });
         });
     }

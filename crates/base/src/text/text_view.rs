@@ -792,7 +792,7 @@ impl Element for TextView {
             .relative()
             .text_color(foreground)
             .on_action(move |_: &crate::input::Copy, window, cx| {
-                let text = TextSelection::selected_text(window, cx).trim().to_string();
+                let text = TextSelection::selected_text(window, cx);
                 if text.is_empty() {
                     cx.propagate();
                     return;

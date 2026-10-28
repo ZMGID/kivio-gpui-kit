@@ -1,6 +1,5 @@
 use std::{rc::Rc, time::Duration};
 
-#[cfg(feature = "gpui-fast")]
 use gpui::Refineable as _;
 use gpui::{
     AbsoluteLength, AnyElement, App, Axis, Bounds, ClickEvent, ElementId, Hsla, ImageSource,
@@ -9,11 +8,15 @@ use gpui::{
     StyleRefinement, Styled, StyledImage as _, Window, black, canvas, div, img, linear_color_stop,
     linear_gradient, point, prelude::FluentBuilder as _, px, relative, rems, white,
 };
+#[cfg(not(feature = "gpui-fast"))]
+use gpui::{Corners, Element, GlobalElementId, InspectorElementId, LayoutId};
 use gpui_base::{
     is_mobile,
     motion::{Transition, transition},
 };
 use rust_i18n::t;
+#[cfg(not(feature = "gpui-fast"))]
+use std::cell::Cell;
 
 use crate::{
     ActiveTheme as _, Icon, IconName, InteractiveElementExt as _, Sizable, Size, StyledExt as _,
@@ -741,6 +744,90 @@ impl Styled for AttachmentMedia {
     }
 }
 
+#[cfg(not(feature = "gpui-fast"))]
+struct MediaClip {
+    bounds: Cell<Bounds<Pixels>>,
+    corners: Corners<Pixels>,
+}
+
+#[cfg(not(feature = "gpui-fast"))]
+struct MediaClipElement {
+    child: AnyElement,
+    clip: Rc<MediaClip>,
+    bounds_owner: bool,
+}
+
+#[cfg(not(feature = "gpui-fast"))]
+impl IntoElement for MediaClipElement {
+    type Element = Self;
+
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+#[cfg(not(feature = "gpui-fast"))]
+impl Element for MediaClipElement {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, ()) {
+        (self.child.request_layout(window, cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if self.bounds_owner {
+            self.clip.bounds.set(bounds);
+            self.child.prepaint(window, cx);
+        } else {
+            window.with_rounded_clip(self.clip.bounds.get(), self.clip.corners, |window| {
+                self.child.prepaint(window, cx);
+            });
+        }
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut (),
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if self.bounds_owner {
+            self.child.paint(window, cx);
+        } else {
+            window.with_rounded_clip(self.clip.bounds.get(), self.clip.corners, |window| {
+                self.child.paint(window, cx);
+            });
+        }
+    }
+}
+
 impl RenderOnce for AttachmentMedia {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let tokens = cx.theme().semantic_tokens();
@@ -823,8 +910,39 @@ impl RenderOnce for AttachmentMedia {
         } else {
             None
         };
+        #[cfg(not(feature = "gpui-fast"))]
+        let clip = (has_source
+            || glyph.is_some()
+            || !self.children.is_empty()
+            || !self.overlays.is_empty())
+        .then(|| {
+            let radius = AbsoluteLength::from(radius);
+            let mut corners = Corners {
+                top_left: radius,
+                top_right: radius,
+                bottom_right: radius,
+                bottom_left: radius,
+            };
+            corners.refine(&self.style.corner_radii);
+            Rc::new(MediaClip {
+                bounds: Cell::new(Bounds::default()),
+                corners: corners.to_pixels(window.rem_size()),
+            })
+        });
+        // The surface paints its own rounded fill and border; only descendants need the clip.
+        #[cfg(not(feature = "gpui-fast"))]
+        let clip_child = |child: AnyElement| {
+            MediaClipElement {
+                child,
+                clip: clip.as_ref().expect("media child needs a clip").clone(),
+                bounds_owner: false,
+            }
+            .into_any_element()
+        };
+        #[cfg(feature = "gpui-fast")]
+        let clip_child = |child: AnyElement| child;
 
-        let mut surface = div()
+        let surface = div()
             .relative()
             .flex()
             .flex_shrink_0()
@@ -862,11 +980,11 @@ impl RenderOnce for AttachmentMedia {
                     image.style().corner_radii.refine(&corner_radii);
                     image
                 };
-                this.child(image)
+                this.child(clip_child(image.into_any_element()))
             })
             .map(|this| match glyph {
-                Some(glyph) => this.child(glyph),
-                None => this.children(self.children),
+                Some(glyph) => this.child(clip_child(glyph)),
+                None => this.children(self.children.into_iter().map(&clip_child)),
             })
             .when_some(scrim, |this, (opacity, control)| {
                 let scrim = div()
@@ -883,20 +1001,25 @@ impl RenderOnce for AttachmentMedia {
                     scrim.style().corner_radii.refine(&corner_radii);
                     scrim
                 };
-                this.child(scrim)
+                this.child(clip_child(scrim.into_any_element()))
             })
-            .children(self.overlays)
+            .children(self.overlays.into_iter().map(&clip_child))
             .refine_style(&self.style);
         #[cfg(not(feature = "gpui-fast"))]
         {
-            let corners = crate::styled::corner_radii(surface.style(), window.rem_size());
-            // The clip owns antialiasing; do not multiply it by the same rounded fill.
-            surface.style().corner_radii = Default::default();
-            crate::rounded_clip(corners, surface).into_any_element()
+            match clip {
+                Some(clip) => MediaClipElement {
+                    child: surface.into_any_element(),
+                    clip,
+                    bounds_owner: true,
+                }
+                .into_any_element(),
+                None => surface.into_any_element(),
+            }
         }
         #[cfg(feature = "gpui-fast")]
         {
-            let _ = (&mut surface, window);
+            let _ = window;
             surface.into_any_element()
         }
     }
@@ -1714,6 +1837,321 @@ mod tests {
             .child("Second");
 
         assert_eq!(group.children.len(), 2);
+    }
+
+    #[cfg(not(feature = "gpui-fast"))]
+    mod media_border {
+        use std::{cell::Cell, rc::Rc};
+
+        use gpui::{Background, Context, Modifiers, Render, TestAppContext, rgb};
+
+        use super::super::*;
+
+        const FILL: u32 = 0x3a6b87;
+        const BORDER: u32 = 0xd48625;
+        const CONTENT: u32 = 0x8572c4;
+        const OVERLAY: u32 = 0x83b443;
+        const OPACITY: f32 = 0.75;
+
+        fn styled<T: Styled>(element: T) -> T {
+            element
+                .size(px(64.))
+                .rounded_tl(px(4.))
+                .rounded_tr(px(8.))
+                .rounded_br(px(12.))
+                .rounded_bl(px(16.))
+                .border_t(px(2.))
+                .border_r(px(3.))
+                .border_b(px(4.))
+                .border_l(px(5.))
+                .border_color(rgb(BORDER))
+                .border_dashed()
+                .bg(rgb(FILL))
+                .opacity(OPACITY)
+        }
+
+        struct BorderFixture {
+            inherited: bool,
+            clicks: Rc<Cell<usize>>,
+        }
+
+        impl Render for BorderFixture {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let clicks = self.clicks.clone();
+                let media = styled(AttachmentMedia::new())
+                    .child(
+                        div()
+                            .id("content")
+                            .absolute()
+                            .top(px(-10.))
+                            .left(px(-10.))
+                            .size(px(90.))
+                            .bg(rgb(CONTENT))
+                            .on_click(move |_, _, _| clicks.set(clicks.get() + 1)),
+                    )
+                    .overlay(div().size_full().bg(rgb(OVERLAY)));
+                let row = div()
+                    .size_full()
+                    .p(px(16.))
+                    .flex()
+                    .items_start()
+                    .gap(px(20.))
+                    .child(media)
+                    .child(styled(div()));
+                if self.inherited {
+                    crate::rounded_clip(px(20.), row).into_any_element()
+                } else {
+                    row.into_any_element()
+                }
+            }
+        }
+
+        #[gpui::test]
+        fn styled_media_matches_plain_border_and_clips_content_once(cx: &mut TestAppContext) {
+            cx.update(crate::init);
+            for inherited in [false, true] {
+                let clicks = Rc::new(Cell::new(0));
+                let (_, cx) = cx.add_window_view({
+                    let clicks = clicks.clone();
+                    move |_, _| BorderFixture { inherited, clicks }
+                });
+                cx.simulate_resize(gpui::size(px(300.), px(120.)));
+                cx.simulate_scale_factor_change(2.);
+                let bounds = cx.update(|window, cx| {
+                    window.draw(cx).clear(cx);
+                    assert_eq!(window.scale_factor(), 2.);
+                    let quads = window.painted_quads();
+                    let fill = Background::from(rgb(FILL)).opacity(OPACITY);
+                    let mut fills: Vec<_> = quads
+                        .iter()
+                        .filter(|quad| quad.background == fill)
+                        .collect();
+                    fills.sort_by(|a, b| a.bounds.left().0.total_cmp(&b.bounds.left().0));
+                    assert_eq!(fills.len(), 2);
+                    let (media, plain) = (fills[0], fills[1]);
+                    assert_eq!(media.bounds.size, plain.bounds.size);
+                    assert_eq!(media.corner_radii, plain.corner_radii);
+                    assert_eq!(media.corner_radii.top_left.0, 8.);
+                    assert_eq!(media.corner_radii.top_right.0, 16.);
+                    assert_eq!(media.corner_radii.bottom_right.0, 24.);
+                    assert_eq!(media.corner_radii.bottom_left.0, 32.);
+                    assert_eq!(media.fade.clip, plain.fade.clip);
+                    assert_eq!(media.fade.clip != Default::default(), inherited);
+
+                    let border_color = Hsla::from(rgb(BORDER)).opacity(OPACITY);
+                    let media_border: Vec<_> = quads
+                        .iter()
+                        .filter(|quad| {
+                            quad.bounds == media.bounds && quad.border_color == border_color
+                        })
+                        .collect();
+                    let plain_border: Vec<_> = quads
+                        .iter()
+                        .filter(|quad| {
+                            quad.bounds == plain.bounds && quad.border_color == border_color
+                        })
+                        .collect();
+                    assert!(!media_border.is_empty());
+                    assert_eq!(media_border.len(), plain_border.len());
+                    for border in media_border {
+                        assert_eq!(border.corner_radii, media.corner_radii);
+                        assert_eq!(border.border_widths.top.0, 4.);
+                        assert_eq!(border.border_widths.right.0, 6.);
+                        assert_eq!(border.border_widths.bottom.0, 8.);
+                        assert_eq!(border.border_widths.left.0, 10.);
+                        assert_eq!(border.fade.clip, media.fade.clip);
+                        assert!(plain_border.iter().any(|reference| {
+                            border.corner_radii == reference.corner_radii
+                                && border.border_widths == reference.border_widths
+                                && border.border_style == reference.border_style
+                                && border.background == reference.background
+                                && border.content_mask.bounds.size
+                                    == reference.content_mask.bounds.size
+                                && border.content_mask.bounds.origin - border.bounds.origin
+                                    == reference.content_mask.bounds.origin
+                                        - reference.bounds.origin
+                        }));
+                    }
+
+                    let content = quads
+                        .iter()
+                        .find(|quad| {
+                            quad.background == Background::from(rgb(CONTENT)).opacity(OPACITY)
+                        })
+                        .expect("media content painted");
+                    let overlay = quads
+                        .iter()
+                        .find(|quad| {
+                            quad.background == Background::from(rgb(OVERLAY)).opacity(OPACITY)
+                        })
+                        .expect("media overlay painted");
+                    let clip = content.fade.clip;
+                    assert_eq!(clip, overlay.fade.clip);
+                    assert_eq!(clip.left, media.bounds.left().0);
+                    assert_eq!(clip.top, media.bounds.top().0);
+                    assert_eq!(clip.right, media.bounds.right().0);
+                    assert_eq!(clip.bottom, media.bounds.bottom().0);
+                    assert_eq!(clip.top_left, 8.);
+                    assert_eq!(clip.top_right, 16.);
+                    assert_eq!(clip.bottom_right, 24.);
+                    assert_eq!(clip.bottom_left, 32.);
+                    assert_eq!(content.corner_radii, Default::default());
+                    assert_eq!(overlay.corner_radii, Default::default());
+                    assert_eq!(
+                        content.content_mask.bounds.left().0,
+                        media.bounds.left().0 + 10.
+                    );
+                    assert_eq!(
+                        content.content_mask.bounds.right().0,
+                        media.bounds.right().0 - 6.
+                    );
+                    assert_eq!(
+                        content.content_mask.bounds.top().0,
+                        media.bounds.top().0 + 4.
+                    );
+                    assert_eq!(
+                        content.content_mask.bounds.bottom().0,
+                        media.bounds.bottom().0 - 8.
+                    );
+                    media.bounds
+                });
+
+                let left = bounds.left().0 / 2.;
+                let middle = (bounds.top().0 + bounds.size.height.0 / 2.) / 2.;
+                cx.simulate_click(point(px(left + 1.), px(middle)), Modifiers::default());
+                assert_eq!(
+                    clicks.get(),
+                    0,
+                    "the border must not extend the child hitbox"
+                );
+                cx.simulate_click(point(px(left + 8.), px(middle)), Modifiers::default());
+                assert_eq!(clicks.get(), 1, "the visible child remains interactive");
+            }
+        }
+
+        struct EmptyMedia;
+
+        impl Render for EmptyMedia {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                AttachmentMedia::new()
+                    .size(px(64.))
+                    .rounded_tl(rems(1.))
+                    .bg(rgb(FILL))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+            }
+        }
+
+        #[gpui::test]
+        fn empty_media_keeps_default_and_rem_corner_radii(cx: &mut TestAppContext) {
+            cx.update(crate::init);
+            let (_, cx) = cx.add_window_view(|_, _| EmptyMedia);
+            cx.simulate_scale_factor_change(2.);
+            cx.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                let quads = window.painted_quads();
+                let fill = quads
+                    .iter()
+                    .find(|quad| quad.background == Background::from(rgb(FILL)))
+                    .expect("empty media fill painted");
+                let border = quads
+                    .iter()
+                    .find(|quad| {
+                        quad.bounds == fill.bounds && quad.border_color == Hsla::from(rgb(BORDER))
+                    })
+                    .expect("empty media border painted");
+                assert_eq!(fill.corner_radii.top_left.0, f32::from(window.rem_size()) * 2.);
+                assert_eq!(
+                    fill.corner_radii.top_right.0,
+                    f32::from(cx.theme().semantic_tokens().radius.md) * 2.
+                );
+                assert_eq!(border.corner_radii, fill.corner_radii);
+                assert_eq!(fill.fade.clip, Default::default());
+                assert_eq!(border.fade.clip, Default::default());
+            });
+        }
+
+        struct FailedImage {
+            image: std::sync::Arc<gpui::RenderImage>,
+            retries: Rc<Cell<usize>>,
+        }
+
+        impl Render for FailedImage {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let retries = self.retries.clone();
+                div().size_full().p(px(16.)).child(
+                    Attachment::new()
+                        .id("image-attachment")
+                        .status(AttachmentStatus::Failed)
+                        .w(px(100.))
+                        .h(px(90.))
+                        .on_retry(move |_, _, _| retries.set(retries.get() + 1))
+                        .media(
+                            styled(AttachmentMedia::new())
+                                .src(self.image.clone())
+                                .overlay(div().size_full().bg(rgb(OVERLAY))),
+                        ),
+                )
+            }
+        }
+
+        #[gpui::test]
+        fn image_scrim_and_retry_keep_media_clip(cx: &mut TestAppContext) {
+            cx.update(crate::init);
+            let image = cx.update(|cx| {
+                gpui::Image::from_bytes(
+                    gpui::ImageFormat::Svg,
+                    br##"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><rect width="8" height="8" fill="#436789"/></svg>"##.to_vec(),
+                )
+                .to_image_data(cx.svg_renderer())
+                .expect("decode the preview image")
+            });
+            let retries = Rc::new(Cell::new(0));
+            let (_, cx) = cx.add_window_view({
+                let image = image.clone();
+                let retries = retries.clone();
+                move |_, _| FailedImage { image, retries }
+            });
+            cx.simulate_resize(gpui::size(px(200.), px(150.)));
+            cx.simulate_scale_factor_change(2.);
+            let bounds = cx.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                assert!(
+                    window.has_image_atlas_entry(&image),
+                    "preview image painted"
+                );
+                let quads = window.painted_quads();
+                let fill = quads
+                    .iter()
+                    .find(|quad| quad.background == Background::from(rgb(FILL)).opacity(OPACITY))
+                    .expect("media fill painted");
+                let scrim = quads
+                    .iter()
+                    .find(|quad| {
+                        quad.background
+                            == Background::from(black().opacity(FAILED_SCRIM)).opacity(OPACITY)
+                    })
+                    .expect("failed image scrim painted");
+                let overlay = quads
+                    .iter()
+                    .find(|quad| quad.background == Background::from(rgb(OVERLAY)).opacity(OPACITY))
+                    .expect("image overlay painted");
+                assert_eq!(scrim.fade.clip, overlay.fade.clip);
+                assert_eq!(scrim.fade.clip.left, fill.bounds.left().0);
+                assert_eq!(scrim.fade.clip.top_right, 16.);
+                assert_eq!(scrim.fade.clip.bottom_left, 32.);
+                assert_eq!(scrim.corner_radii, Default::default());
+                fill.bounds
+            });
+            cx.simulate_click(
+                point(
+                    px((bounds.left().0 + bounds.size.width.0 / 2.) / 2.),
+                    px((bounds.top().0 + bounds.size.height.0 / 2.) / 2.),
+                ),
+                Modifiers::default(),
+            );
+            assert_eq!(retries.get(), 1);
+        }
     }
 
     mod click_dispatch {

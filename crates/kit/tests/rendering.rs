@@ -698,6 +698,96 @@ mod rendering {
     }
 
     #[cfg(not(feature = "gpui-fast"))]
+    struct MediaBorders;
+    #[cfg(not(feature = "gpui-fast"))]
+    impl Render for MediaBorders {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            fn border<T: Styled>(element: T) -> T {
+                element
+                    .size(px(64.))
+                    .rounded(px(16.))
+                    .border(px(4.))
+                    .border_color(gpui_kit::rgb(0xff0000))
+                    .bg(gpui_kit::rgb(0x0000ff))
+            }
+
+            use gpui_kit::component::attachment::AttachmentMedia;
+
+            div()
+                .size_full()
+                .bg(gpui_kit::rgb(0x000000))
+                .flex()
+                .items_start()
+                .gap(px(8.))
+                .p(px(8.))
+                .child(div().id("media-child").size(px(64.)).child(border(
+                    AttachmentMedia::new().child(div().size_full().bg(gpui_kit::rgb(0x0000ff))),
+                )))
+                .child(
+                    div().id("plain-child").size(px(64.)).child(border(
+                        div()
+                            .overflow_hidden()
+                            .child(div().size_full().bg(gpui_kit::rgb(0x0000ff))),
+                    )),
+                )
+                .child(
+                    div()
+                        .id("media-empty")
+                        .size(px(64.))
+                        .child(border(AttachmentMedia::new()).border(px(0.))),
+                )
+                .child(
+                    div()
+                        .id("plain-empty")
+                        .size(px(64.))
+                        .child(border(div().overflow_hidden()).border(px(0.))),
+                )
+        }
+    }
+
+    #[cfg(not(feature = "gpui-fast"))]
+    fn attachment_media_border_matches_plain_rounded_pixels() {
+        let mut cx = context(Arc::new(Assets));
+        let handle = open_window(&mut cx, (320., 80.), |_, _| MediaBorders);
+        let bounds = cx
+            .update_window(handle, |_, window, _| {
+                ["media-child", "plain-child", "media-empty", "plain-empty"]
+                    .map(|id| window.find(id).bounds())
+            })
+            .unwrap();
+        let capture = Capture::take(&mut cx, handle);
+        assert_eq!(capture.scale(), 2.);
+        let pixel = |index: usize, x: i32, y: i32| {
+            capture.get_pixel(
+                capture.device(bounds[index].left()) + x,
+                capture.device(bounds[index].top()) + y,
+            )
+        };
+        for index in [0, 1] {
+            let arc = pixel(index, 11, 11);
+            assert!(
+                arc[0] > 230 && arc[1] < 16 && arc[2] < 16,
+                "rounded border arc must remain visible above content: {arc:?}"
+            );
+        }
+        let edge = pixel(3, 9, 9);
+        assert!(
+            edge[2] > 0 && edge[2] < 255,
+            "expected antialiased fill: {edge:?}"
+        );
+        for y in 0..32 {
+            for x in 0..32 {
+                let media = pixel(2, x, y);
+                let plain = pixel(3, x, y);
+                assert!(
+                    media.iter().zip(plain).all(|(a, b)| (a - b).abs() <= 2),
+                    "media corner ({x},{y})={media:?}, plain={plain:?}"
+                );
+            }
+        }
+    }
+
+    #[cfg(not(feature = "gpui-fast"))]
     const EVICTION_IMAGE: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><rect width="8" height="8" fill="#ff0000"/></svg>"##;
 
     #[cfg(not(feature = "gpui-fast"))]
@@ -1172,6 +1262,9 @@ mod rendering {
         println!("passed list_selection_is_the_keyboard_cursor");
         #[cfg(not(feature = "gpui-fast"))]
         {
+            println!("running attachment_media_border_matches_plain_rounded_pixels");
+            attachment_media_border_matches_plain_rounded_pixels();
+            println!("passed attachment_media_border_matches_plain_rounded_pixels");
             println!("running image_eviction_releases_gpu_atlas_entries_and_reuploads");
             image_eviction_releases_gpu_atlas_entries_and_reuploads();
             println!("passed image_eviction_releases_gpu_atlas_entries_and_reuploads");
@@ -1182,7 +1275,7 @@ mod rendering {
             println!("passed table_shows_keyboard_focus_only (focus_ring = {focus_ring})");
         }
         #[cfg(not(feature = "gpui-fast"))]
-        println!("rendering: 14 passed (real offscreen renderer)");
+        println!("rendering: 15 passed (real offscreen renderer)");
         #[cfg(feature = "gpui-fast")]
         println!("rendering: 13 passed (real offscreen renderer)");
     }

@@ -32,6 +32,13 @@ pub type MarkdownBlockParserFn =
 pub type MarkdownBlockRenderFn =
     dyn Fn(&MarkdownNode, &mut Window, &mut App) -> AnyElement + Send + Sync;
 
+/// Maps a preprocessed byte offset back to its original source byte offset.
+pub type MarkdownSourceOffsetFn = dyn Fn(usize) -> usize + Send + Sync;
+type MarkdownSourcePreprocessorFn =
+    dyn Fn(&str) -> Option<(String, Arc<MarkdownSourceOffsetFn>)> + Send + Sync;
+type MarkdownAstPostprocessorFn =
+    dyn for<'a> Fn(&mut mdast::Node, &MarkdownParseContext<'a>) + Send + Sync;
+
 /// Parser for a single inline AST node; follows the block parser contract.
 type MarkdownInlineParserFn = MarkdownBlockParserFn;
 
@@ -246,6 +253,8 @@ impl PartialEq for MarkdownNode {
 pub struct MarkdownExtensions {
     enable_mdx: bool,
     enable_frontmatter: bool,
+    source_preprocessor: Option<Arc<MarkdownSourcePreprocessorFn>>,
+    ast_postprocessor: Option<Arc<MarkdownAstPostprocessorFn>>,
     block_parsers: Vec<Arc<MarkdownBlockParserFn>>,
     block_renderers: HashMap<SharedString, Arc<MarkdownBlockRenderFn>>,
     inline_parsers: Vec<Arc<MarkdownInlineParserFn>>,
@@ -263,6 +272,33 @@ impl MarkdownExtensions {
         self.bump_revision();
         self
     }
+
+    /// Preprocess Markdown syntax and supply a monotonic map back to the source.
+    ///
+    /// The original source remains authoritative for plugins, selection and copy.
+    /// Mapped offsets must be original UTF-8 boundaries and cover the whole source.
+    /// Change `parser_revision` when the preprocessor's captured state changes.
+    pub fn source_preprocessor<F>(mut self, preprocessor: F) -> Self
+    where
+        F: Fn(&str) -> Option<(String, Arc<MarkdownSourceOffsetFn>)> + Send + Sync + 'static,
+    {
+        self.source_preprocessor = Some(Arc::new(preprocessor));
+        self.bump_revision();
+        self
+    }
+    /// Adjust the parsed AST using original-source positions before conversion.
+    ///
+    /// Nodes added by the callback must use UTF-8 ranges in `cx.source()`.
+    /// Change `parser_revision` when the callback's captured state changes.
+    pub fn ast_postprocessor<F>(mut self, postprocessor: F) -> Self
+    where
+        F: for<'a> Fn(&mut mdast::Node, &MarkdownParseContext<'a>) + Send + Sync + 'static,
+    {
+        self.ast_postprocessor = Some(Arc::new(postprocessor));
+        self.bump_revision();
+        self
+    }
+
 
     /// Enable YAML frontmatter parsing.
     ///
@@ -352,6 +388,8 @@ impl MarkdownExtensions {
         self.parser_revision == other.parser_revision
             && self.enable_mdx == other.enable_mdx
             && self.enable_frontmatter == other.enable_frontmatter
+            && self.source_preprocessor.is_some() == other.source_preprocessor.is_some()
+            && self.ast_postprocessor.is_some() == other.ast_postprocessor.is_some()
             && self.block_parsers.len() == other.block_parsers.len()
             && self.block_renderers.len() == other.block_renderers.len()
             && self.inline_parsers.len() == other.inline_parsers.len()
@@ -364,6 +402,14 @@ impl MarkdownExtensions {
                 .block_renderers
                 .keys()
                 .all(|name| other.block_renderers.contains_key(name))
+    }
+
+    pub(crate) fn preprocess_source(&self, source: &str) -> Option<(String, Arc<MarkdownSourceOffsetFn>)> {
+        self.source_preprocessor.as_ref()?.as_ref()(source)
+    }
+
+    pub(crate) fn postprocess_ast(&self, root: &mut mdast::Node, cx: &MarkdownParseContext<'_>) {
+        if let Some(postprocess) = &self.ast_postprocessor { postprocess(root, cx); }
     }
 
     pub(crate) fn push_block_parser<F>(&mut self, parser: F)

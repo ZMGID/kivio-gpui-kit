@@ -19,13 +19,78 @@ use crate::text::{
 /// Parse Markdown into a tree of nodes.
 pub(crate) fn parse(source: &str, cx: &mut NodeContext) -> Result<ParsedDocument, SharedString> {
     let options = cx.markdown_extensions.parse_options();
-    let mut root =
-        markdown::to_mdast(source, &options).map_err(|e| SharedString::from(e.to_string()))?;
+    let mut root = if let Some((rewritten, map)) = cx.markdown_extensions.preprocess_source(source) {
+        match markdown::to_mdast(&rewritten, &options).ok().and_then(|mut root| {
+            restore_source_positions(&mut root, source, rewritten.len(), &*map).then_some(root)
+        }) {
+            Some(root) => root,
+            None => markdown::to_mdast(source, &options).map_err(|e| SharedString::from(e.to_string()))?,
+        }
+    } else {
+        markdown::to_mdast(source, &options).map_err(|e| SharedString::from(e.to_string()))?
+    };
     let mut prose = options;
     prose.constructs.math_text = false;
     prose.constructs.math_flow = false;
     flatten_unclaimed_math(&mut root, source, &prose, cx);
+    cx.markdown_extensions.postprocess_ast(&mut root, &MarkdownParseContext::new(source, cx.offset));
     Ok(ast_to_document(source, root, cx))
+}
+
+/// Restore positions before plugins or selection see the original source.
+fn restore_source_positions(
+    root: &mut Node,
+    source: &str,
+    rewritten_len: usize,
+    map: &dyn Fn(usize) -> usize,
+) -> bool {
+    fn collect(node: &Node, offsets: &mut Vec<usize>) {
+        if let Some(position) = node.position() {
+            offsets.extend([position.start.offset, position.end.offset]);
+        }
+        if let Some(children) = node.children() {
+            for child in children { collect(child, offsets); }
+        }
+    }
+    fn replace(node: &mut Node, positions: &[(usize, Point)]) {
+        if let Some(position) = node.position_mut() {
+            for point in [&mut position.start, &mut position.end] {
+                let index = positions.binary_search_by_key(&point.offset, |(offset, _)| *offset)
+                    .expect("all Markdown positions were collected");
+                *point = positions[index].1.clone();
+            }
+        }
+        if let Some(children) = node.children_mut() {
+            for child in children { replace(child, positions); }
+        }
+    }
+
+    if map(0) != 0 || map(rewritten_len) != source.len() { return false; }
+    let mut offsets = Vec::new();
+    collect(root, &mut offsets);
+    offsets.sort_unstable();
+    offsets.dedup();
+    let mut positions = Vec::with_capacity(offsets.len());
+    let mut cursor = 0;
+    let (mut line, mut column) = (1, 1);
+    let bytes = source.as_bytes();
+    for offset in offsets {
+        if offset > rewritten_len { return false; }
+        let original = map(offset);
+        if original < cursor || original > source.len() || !source.is_char_boundary(original) { return false; }
+        while cursor < original {
+            match bytes[cursor] {
+                b'\r' if bytes.get(cursor + 1) == Some(&b'\n') => {},
+                b'\r' | b'\n' => { line += 1; column = 1; },
+                b'\t' => column += 4 - (column - 1) % 4,
+                _ => column += 1,
+            }
+            cursor += 1;
+        }
+        positions.push((offset, Point::new(line, column, original)));
+    }
+    replace(root, &positions);
+    true
 }
 
 /// Math parsing is on by default, so prose that merely contains two dollar
@@ -2395,6 +2460,55 @@ mod tests {
         assert_eq!(object.accessibility_name(), "x²");
         assert_eq!(document.text(), "中文 before x² after and $ignored$\n");
         assert!(document.to_markdown().contains("**before $x^2$ after**"));
+    }
+
+    #[test]
+    fn source_preprocessor_restores_formula_positions_and_original_copy() {
+        let source = "中文\nprefix\tcost $5 and \\(x\\) after";
+        let extensions = MarkdownExtensions::default()
+            .source_preprocessor(|source| {
+                let dollar = source.find("$5")?;
+                let open = source.find("\\(")?;
+                let close = source.find("\\)")?;
+                let rewritten = source.replacen("$5", "\\$5", 1)
+                    .replacen("\\(", "$", 1).replacen("\\)", "$", 1);
+                let map: Arc<crate::text::MarkdownSourceOffsetFn> = Arc::new(move |offset| {
+                    offset.saturating_sub(usize::from(offset > dollar))
+                        + usize::from(offset > open + 1) + usize::from(offset > close)
+                });
+                Some((rewritten, map))
+            })
+            .plugin(crate::text::markdown_ext::TestInlinePlugin::new("formula").parse_with(|node, cx| {
+                let Node::InlineMath(math) = node else { return None };
+                assert_eq!(math.value, "x");
+                assert_eq!(cx.node_source(node), Some("\\(x\\)"));
+                let position = node.position().unwrap();
+                assert_eq!(position.start.line, 2);
+                assert_eq!(position.start.column, 1 + 8 + "cost $5 and ".len());
+                Some(MarkdownNode::new("formula", ()).text("x²"))
+            }));
+        let mut cx = NodeContext { offset: 73, markdown_extensions: extensions.into(), ..Default::default() };
+        let document = parse(source, &mut cx).unwrap();
+        let paragraph = document.blocks.iter().find_map(first_paragraph).unwrap();
+        let node = paragraph.children.iter().find_map(|node| node.custom.as_ref()).unwrap();
+        let start = 73 + source.find("\\(").unwrap();
+        assert_eq!(node.source_range(), Some(start..start + "\\(x\\)".len()));
+        assert_eq!(node.as_markdown(), "\\(x\\)");
+        assert!(document.text().contains("cost $5 and x² after"));
+        assert_eq!(document.source.as_ref(), source);
+    }
+
+    #[test]
+    fn invalid_preprocessor_map_falls_back_to_original_source() {
+        let source = "before \\(x\\) after";
+        let extensions = MarkdownExtensions::default().source_preprocessor(|_| {
+            let map: Arc<crate::text::MarkdownSourceOffsetFn> = Arc::new(|_| usize::MAX);
+            Some(("before $x$ after".into(), map))
+        });
+        let mut cx = NodeContext { markdown_extensions: extensions.into(), ..Default::default() };
+        let document = parse(source, &mut cx).unwrap();
+        assert_eq!(document.text(), "before (x) after\n");
+        assert_eq!(document.source.as_ref(), source);
     }
 
     #[test]

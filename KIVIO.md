@@ -38,6 +38,7 @@ Maintain each conceptual patch as a separate commit with regression coverage. Wh
 | Source-mapped Markdown extensions | `gpui-base` | Existing mdast conversion, source spans and original clipboard projection | `feat(text): support source-mapped markdown extensions` |
 | Exact Markdown source selection | `gpui-base` | Existing source-range selection and virtual endpoint coverage | `feat(text): copy exact selected markdown source` |
 | Exact source across TextViews | `gpui-base` | Window-selection coverage and original source spans | `fix(text): preserve source at cross-view selection boundaries` |
+| Selectable custom block source | `gpui-base` | Existing TextView inline geometry and Markdown source spans | `feat(text): select source within custom markdown blocks` |
 
 The sidebar patch starts from fork commit `e485b337f2ecb778cf3a5265488baf4dfaac663d`. It uses the existing `gpui-pre` 0.3.10 focus and click behavior, not code copied from Zeron. In the Kivio P1 Windows repro, Tab from the last gallery button skipped all sidebar destinations and wrapped to the first gallery button. The component regression tests exercise Tab, Enter and Space, disabled rows, retained focus, mouse clicks and submenu/caret behavior with `--features test-support`.
 
@@ -107,5 +108,9 @@ Windows focused regressions passed for mixed currency and an inline formula with
 `SelectionFormat::SourceExact` copies the original contiguous source slice when both selection endpoints are painted and mapped. Unmapped or virtualized endpoints fall back to the existing reconstructed `Source` behavior; the existing formats are unchanged. A focused Windows regression covered a partial styled selection crossing blocks and the virtual-endpoint fallback.
 
 Cross-view exact-source copying extends a selected source range to the start or end of its TextView when window coverage continues into another participant. Otherwise trailing link destinations and other invisible syntax disappear. Bounded selections and unmapped fallback are unchanged; a focused Windows regression covers both directions, complete coverage, and invalid UTF-8 offsets.
+
+### Selectable custom block source
+
+A block plugin can opt in to rendering its exact Markdown source as an inline of the containing TextView. This lets a selection begin or end inside the source without a second, overlapping window-selection participant; hidden source retains the existing atomic block behavior. Source ranges are accepted only when the node span and source length agree. A focused Windows regression covers partial Chinese source mapping and clearing; cross-boundary application gestures still require integration verification.
 
 Licensed under Apache-2.0, same as upstream (see `LICENSE-APACHE`).

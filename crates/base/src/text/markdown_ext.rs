@@ -4,15 +4,15 @@ use std::{
     fmt,
     ops::Range,
     sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
 use gpui::{AnyElement, App, IntoElement, SharedString, Window};
 use markdown::{ParseOptions, mdast};
 
-use super::{InlineElement, InlineRenderContext};
+use super::{InlineElement, InlineRenderContext, inline::{Inline, InlineState}};
 use crate::text::node::Span;
 
 static MARKDOWN_EXTENSIONS_REVISION: AtomicU64 = AtomicU64::new(1);
@@ -110,6 +110,30 @@ impl<'a> MarkdownParseContext<'a> {
     }
 }
 
+#[derive(Clone)]
+pub(super) struct SelectableSource {
+    state: Arc<Mutex<InlineState>>,
+    active: Arc<AtomicBool>,
+}
+
+impl SelectableSource {
+    pub(super) fn active(&self) -> bool {
+        self.active.load(Ordering::Relaxed)
+    }
+
+    fn selected_range(&self) -> Option<Range<usize>> {
+        let state = self.state.lock().ok()?;
+        let selection = state.selection?;
+        (selection.start < selection.end).then_some(selection.start..selection.end)
+    }
+
+    pub(super) fn clear(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.selection = None;
+        }
+    }
+}
+
 /// A custom Markdown node produced by [`MarkdownExtensions`].
 #[derive(Clone)]
 pub struct MarkdownNode {
@@ -118,6 +142,7 @@ pub struct MarkdownNode {
     markdown: SharedString,
     accessibility_label: Option<SharedString>,
     data: Arc<dyn Any + Send + Sync>,
+    pub(super) selectable_source: Option<SelectableSource>,
     pub(crate) span: Option<Span>,
 }
 
@@ -133,6 +158,7 @@ impl MarkdownNode {
             markdown: SharedString::default(),
             accessibility_label: None,
             data: Arc::new(data),
+            selectable_source: None,
             span: None,
         }
     }
@@ -204,6 +230,44 @@ impl MarkdownNode {
     pub fn markdown(mut self, markdown: impl Into<SharedString>) -> Self {
         self.markdown = markdown.into();
         self
+    }
+
+    /// Enable selection of this block's original Markdown source as part of its
+    /// containing TextView. Call after setting `markdown` to the exact node source.
+    pub fn with_selectable_source(mut self) -> Self {
+        let mut state = InlineState::default();
+        state.set_text(self.markdown.clone());
+        self.selectable_source = Some(SelectableSource {
+            state: Arc::new(Mutex::new(state)),
+            active: Arc::new(AtomicBool::new(false)),
+        });
+        self
+    }
+
+    /// Render the enabled source, or hide it while displaying another representation.
+    pub fn render_selectable_source(&self, visible: bool) -> Option<AnyElement> {
+        let source = self.selectable_source.as_ref()?;
+        if !visible {
+            if source.active.swap(false, Ordering::Relaxed) { source.clear(); }
+            return None;
+        }
+        source.active.store(true, Ordering::Relaxed);
+        Some(Inline::new(source.state.clone(), Vec::new(), Vec::new(), None).into_any_element())
+    }
+
+    pub(super) fn selected_source_range(&self) -> Option<Range<usize>> {
+        let source = self.selectable_source.as_ref().filter(|source| source.active())?;
+        let range = source.selected_range()?;
+        let span = self.span?;
+        if span.end.checked_sub(span.start)? != self.markdown.len() || range.end > self.markdown.len() {
+            return None;
+        }
+        Some(span.start + range.start..span.start + range.end)
+    }
+
+    pub(super) fn selected_source_text(&self) -> Option<String> {
+        let source = self.selectable_source.as_ref().filter(|source| source.active())?;
+        self.markdown.get(source.selected_range()?).map(str::to_owned)
     }
 
     /// Read typed data.
@@ -566,5 +630,25 @@ impl MarkdownPlugin for TestInlinePlugin {
         self.renderer
             .as_ref()
             .and_then(|render| render(node, context, window, cx))
+    }
+}
+
+#[cfg(test)]
+mod selectable_source_tests {
+    use super::*;
+
+    #[test]
+    fn partial_custom_source_maps_to_the_original_document() {
+        let raw = "```diagram\n中文\n```";
+        let mut node = MarkdownNode::new("diagram", ()).text(raw).markdown(raw).with_selectable_source();
+        node.set_span(Some(Span { start: 10, end: 10 + raw.len() }));
+        let source = node.selectable_source.as_ref().unwrap();
+        source.active.store(true, Ordering::Relaxed);
+        let start = raw.find("中文").unwrap();
+        source.state.lock().unwrap().selection = Some((start..start + "中文".len()).into());
+        assert_eq!(node.selected_source_range(), Some(10 + start..10 + start + "中文".len()));
+        assert_eq!(node.selected_source_text().as_deref(), Some("中文"));
+        source.clear();
+        assert_eq!(node.selected_source_range(), None);
     }
 }

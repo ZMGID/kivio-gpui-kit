@@ -262,6 +262,7 @@ impl Element for TableCellElement {
 struct CustomBlockElement {
     content: AnyElement,
     state: BlockState,
+    selectable_source: Option<super::markdown_ext::SelectableSource>,
 }
 
 impl IntoElement for CustomBlockElement {
@@ -317,7 +318,8 @@ impl Element for CustomBlockElement {
         cx: &mut App,
     ) {
         let view = GlobalState::global(cx).text_view_state();
-        let selection = view.as_ref().and_then(|view| {
+        let selectable_source = self.selectable_source.as_ref().is_some_and(|source| source.active());
+        let selection = if selectable_source { Some(BlockSelection::Empty) } else { view.as_ref().and_then(|view| {
             let state = view.read(cx);
             if !state.is_selectable() {
                 return None;
@@ -330,10 +332,10 @@ impl Element for CustomBlockElement {
             }
             let (start, end) = state.painted_selection_points(cx)?;
             custom_block_selection(bounds, start, end)
-        });
+        }) };
         self.state.set_selection(selection);
         if let Some(view) = &view {
-            if view.read(cx).is_selectable() {
+            if view.read(cx).is_selectable() && !selectable_source {
                 view.read(cx).selection_adapter.register_copy_projection(
                     super::selection_adapter::CopyProjection::CustomBlock(
                         CustomBlockSelectionProjection {
@@ -492,8 +494,8 @@ impl BlockNode {
                 }
             }
             // A plugin's text stands in for content its source spells out.
-            BlockNode::Custom { state, .. } => {
-                if state.is_selected() {
+            BlockNode::Custom { node, state } => {
+                if state.is_selected() || node.selected_source_range().is_some() {
                     styles = SelectionStyles::Mixed;
                 }
             }
@@ -527,7 +529,9 @@ impl BlockNode {
             }
             BlockNode::CodeBlock(code_block) => selected = code_block.selected_source_range(),
             BlockNode::Custom { node, state } => {
-                if state.is_selected() {
+                if let Some(range) = node.selected_source_range() {
+                    selected = SourceRangeSelection::Mapped(range);
+                } else if state.is_selected() {
                     selected = node
                         .source_range()
                         .map_or(SourceRangeSelection::Unmapped, SourceRangeSelection::Mapped);
@@ -673,15 +677,18 @@ impl BlockNode {
                 }
             }
             BlockNode::Custom { node, state } => {
-                if matches!(kind, BlockTextKind::All) || state.is_selected() {
-                    let content = match kind {
-                        BlockTextKind::SelectedSource => Cow::Owned(node.to_markdown()),
-                        _ => Cow::Borrowed(node.as_text()),
-                    };
-                    if !content.is_empty() {
-                        text.push_str(&content);
-                        text.push('\n');
-                    }
+                let content = match kind {
+                    BlockTextKind::All => Some(Cow::Borrowed(node.as_text())),
+                    BlockTextKind::Selected | BlockTextKind::SelectedSource => node.selected_source_text()
+                        .map(Cow::Owned)
+                        .or_else(|| state.is_selected().then(|| match kind {
+                            BlockTextKind::SelectedSource => Cow::Owned(node.to_markdown()),
+                            _ => Cow::Borrowed(node.as_text()),
+                        })),
+                };
+                if let Some(content) = content.filter(|content| !content.is_empty()) {
+                    text.push_str(&content);
+                    text.push('\n');
                 }
             }
             BlockNode::Definition { .. }
@@ -759,8 +766,9 @@ impl BlockNode {
                 }
             }
             BlockNode::CodeBlock(code_block) => code_block.clear_selection(),
-            BlockNode::Custom { state, .. } => {
+            BlockNode::Custom { node, state } => {
                 state.clear_selection();
+                if let Some(source) = &node.selectable_source { source.clear(); }
             }
             BlockNode::Definition { .. }
             | BlockNode::Break { .. }
@@ -4373,6 +4381,7 @@ impl BlockNode {
                     .child(CustomBlockElement {
                         content: inner,
                         state: state.clone(),
+                        selectable_source: node.selectable_source.clone(),
                     })
                     .into_any_element()
             }

@@ -1,4 +1,4 @@
-use std::{cell::RefCell, ops::RangeInclusive, rc::Rc};
+use std::{cell::RefCell, ops::{Range, RangeInclusive}, rc::Rc};
 
 use crate::{
     GlobalState, TextSelectionContentKey, TextSelectionCoverage, TextSelectionEndpoint,
@@ -11,6 +11,20 @@ use super::{
     TextViewState, inline::InlineSelectionProjection,
     inline_object::InlineObjectSelectionProjection, node::CustomBlockSelectionProjection,
 };
+
+fn selected_source_with_coverage(
+    source: &str,
+    mut range: Range<usize>,
+    coverage: TextSelectionCoverage,
+) -> Option<&str> {
+    match coverage {
+        TextSelectionCoverage::Full => range = 0..source.len(),
+        TextSelectionCoverage::FromStart => range.start = 0,
+        TextSelectionCoverage::ToEnd => range.end = source.len(),
+        TextSelectionCoverage::Bounded => {}
+    }
+    source.get(range)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct CachedBlockEndpoint {
@@ -257,6 +271,13 @@ impl TextViewSelectionAdapter {
                 } else {
                     current.block_range(selection_id, last)
                 };
+                if anchor_cell.is_none()
+                    && state.selection_format == super::SelectionFormat::SourceExact
+                    && let Some(range) = state.selected_source_range()
+                    && let Some(source) = selected_source_with_coverage(&state.source(), range, current.coverage)
+                {
+                    return source.to_owned();
+                }
                 state.selected_text_in(blocks)
             },
             cx,
@@ -465,5 +486,22 @@ impl TextViewSelectionAdapter {
         let layout = frame.text_runs.first().unwrap().layout();
         layout.position_for_index(index).unwrap()
             + gpui::point(Pixels::ZERO, layout.line_height() / 2.)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cross_view_source_keeps_unpainted_link_delimiters() {
+        let source = "中文 **bold** [link](https://example.com)";
+        let start = source.find("bold").unwrap();
+        let end = start + "bold".len();
+        assert_eq!(selected_source_with_coverage(source, start..end, TextSelectionCoverage::Bounded), Some("bold"));
+        assert_eq!(selected_source_with_coverage(source, start..end, TextSelectionCoverage::ToEnd), Some("bold** [link](https://example.com)"));
+        assert_eq!(selected_source_with_coverage(source, start..end, TextSelectionCoverage::FromStart), Some("中文 **bold"));
+        assert_eq!(selected_source_with_coverage(source, start..end, TextSelectionCoverage::Full), Some(source));
+        assert_eq!(selected_source_with_coverage(source, 1..end, TextSelectionCoverage::Bounded), None);
     }
 }

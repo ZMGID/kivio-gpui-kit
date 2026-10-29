@@ -131,6 +131,13 @@ impl ParsedDocument {
             None => (painted_first, painted_last),
         };
 
+        if format == SelectionFormat::SourceExact && painted[first] && painted[last] {
+            if let Some(range) = self.selected_source_range() {
+                if let Some(source) = self.source.get(range) { return source.to_owned(); }
+            }
+        }
+        let format = if format == SelectionFormat::SourceExact { SelectionFormat::Source } else { format };
+
         // A selection within one style copies as the text it renders; one
         // that is only partly painted cannot tell, and keeps its source.
         let format = match format {
@@ -312,6 +319,25 @@ mod tests {
         (0..document.blocks.len())
             .map(|ix| flow_position(&document.blocks, ix))
             .collect()
+    }
+
+    #[test]
+    fn exact_source_selection_preserves_original_bytes_across_blocks() {
+        use crate::text::{node::BlockNode, SelectionFormat};
+        let document = markdown::parse("a **bold** after\n\nanother", &mut NodeContext::default()).unwrap();
+        let BlockNode::Paragraph(first) = &document.blocks[0] else { panic!("first paragraph") };
+        let BlockNode::Paragraph(last) = &document.blocks[1] else { panic!("last paragraph") };
+        for (paragraph, selection) in [(first, 3..12), (last, 0..3)] {
+            let mut state = paragraph.state.lock().unwrap();
+            state.set_text(paragraph.text().into());
+            state.selection = Some(selection.into());
+        }
+        assert_eq!(document.selected_text(SelectionFormat::SourceExact, None), "old** after\n\nano");
+        first.state.lock().unwrap().selection = None;
+        assert_eq!(
+            document.selected_text(SelectionFormat::SourceExact, Some(0..=1)),
+            document.selected_text(SelectionFormat::Source, Some(0..=1)),
+        );
     }
 
     #[test]

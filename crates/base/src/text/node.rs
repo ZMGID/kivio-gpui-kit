@@ -459,7 +459,7 @@ impl BlockNode {
     pub(super) fn selected_text(&self, format: SelectionFormat) -> String {
         self.text_by_kind(match format {
             SelectionFormat::Plain => BlockTextKind::Selected,
-            SelectionFormat::Source | SelectionFormat::SourceAcrossStyles => {
+            SelectionFormat::Source | SelectionFormat::SourceExact | SelectionFormat::SourceAcrossStyles => {
                 BlockTextKind::SelectedSource
             }
         })

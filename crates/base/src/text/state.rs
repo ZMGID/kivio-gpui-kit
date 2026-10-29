@@ -82,6 +82,11 @@ pub enum SelectionFormat {
     /// reconstructed as Markdown from the parsed nodes (e.g. selecting inside
     /// a `**bold**` run yields `**bold**`).
     Source,
+    /// The exact contiguous Markdown source covered by the selection.
+    ///
+    /// Unlike `Source`, this does not reconstruct markup or add separators.
+    /// If either endpoint is unavailable or unmapped, it falls back to `Source`.
+    SourceExact,
     /// The rendered text while the selection stays within one style, the
     /// source as soon as it takes in several.
     ///

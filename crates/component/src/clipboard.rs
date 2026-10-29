@@ -121,37 +121,39 @@ impl RenderOnce for Clipboard {
                 self.accessibility_label
                     .unwrap_or_else(|| t!("Copy").into()),
             )
-            .when(!copied, |this| {
-                this.on_click({
-                    let state = state.clone();
-                    let on_copied = self.on_copied.clone();
-                    move |_, window, cx| {
-                        cx.stop_propagation();
-                        let value = value_fn
-                            .as_ref()
-                            .map(|f| f(window, cx))
-                            .unwrap_or_else(|| value.clone());
-                        cx.write_to_clipboard(ClipboardItem::new_string(value.to_string()));
-                        state.update(cx, |state, cx| {
-                            state.copied = true;
-                            cx.notify();
-                        });
+            .on_click({
+                let state = state.clone();
+                let on_copied = self.on_copied.clone();
+                move |_, window, cx| {
+                    cx.stop_propagation();
+                    let value = value_fn
+                        .as_ref()
+                        .map(|f| f(window, cx))
+                        .unwrap_or_else(|| value.clone());
+                    cx.write_to_clipboard(ClipboardItem::new_string(value.to_string()));
+                    let generation = state.update(cx, |state, cx| {
+                        state.copied = true;
+                        state.generation = state.generation.wrapping_add(1);
+                        cx.notify();
+                        state.generation
+                    });
 
-                        let state = state.clone();
-                        cx.spawn(async move |cx| {
-                            cx.background_executor().timer(Duration::from_secs(2)).await;
-                            _ = state.update(cx, |state, cx| {
+                    let state = state.clone();
+                    cx.spawn(async move |cx| {
+                        cx.background_executor().timer(Duration::from_secs(2)).await;
+                        _ = state.update(cx, |state, cx| {
+                            if state.generation == generation {
                                 state.copied = false;
                                 cx.notify();
-                            });
-                        })
-                        .detach();
+                            }
+                        });
+                    })
+                    .detach();
 
-                        if let Some(on_copied) = &on_copied {
-                            on_copied(value.clone(), window, cx);
-                        }
+                    if let Some(on_copied) = &on_copied {
+                        on_copied(value.clone(), window, cx);
                     }
-                })
+                }
             })
     }
 }
@@ -160,4 +162,59 @@ impl RenderOnce for Clipboard {
 #[derive(Default)]
 struct ClipboardState {
     copied: bool,
+    generation: u64,
+}
+
+#[cfg(all(test, feature = "test-support"))]
+mod tests {
+    use std::{cell::RefCell, rc::Rc};
+
+    use gpui::{
+        div, point, px, AppContext as _, Context, Modifiers, ParentElement as _,
+        Render, Styled as _, TestAppContext, Window,
+    };
+
+    use super::Clipboard;
+
+    struct CopyButtons(Rc<RefCell<Vec<String>>>);
+
+    impl Render for CopyButtons {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+            let first = self.0.clone();
+            let second = self.0.clone();
+            div()
+                .relative()
+                .w(px(160.))
+                .h(px(48.))
+                .child(div().absolute().left(px(0.)).top(px(0.)).child(
+                    Clipboard::new("copy-a").value("A").on_copied(move |value, _, _| {
+                        first.borrow_mut().push(value.to_string());
+                    }),
+                ))
+                .child(div().absolute().left(px(80.)).top(px(0.)).child(
+                    Clipboard::new("copy-b").value("B").on_copied(move |value, _, _| {
+                        second.borrow_mut().push(value.to_string());
+                    }),
+                ))
+        }
+    }
+
+    #[gpui::test]
+    fn copied_indicator_does_not_block_repeated_copy(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let copied = Rc::new(RefCell::new(Vec::new()));
+        let (_, cx) = cx.add_window_view({
+            let copied = copied.clone();
+            move |_, _| CopyButtons(copied)
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        for (x, expected) in [(10., "A"), (90., "B"), (10., "A")] {
+            cx.simulate_click(point(px(x), px(10.)), Modifiers::default());
+            cx.update(|window, cx| {
+                assert_eq!(cx.read_from_clipboard().and_then(|item| item.text()).as_deref(), Some(expected));
+                window.draw(cx).clear(cx);
+            });
+        }
+        assert_eq!(copied.borrow().as_slice(), &["A".to_owned(), "B".to_owned(), "A".to_owned()]);
+    }
 }
